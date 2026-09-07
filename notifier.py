@@ -61,29 +61,28 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"  # ellipsis
 
 
-def available() -> bool:
-    """Whether posting a notification is plausible right now.
+def _backend() -> str | None:
+    """Return the native notification backend available on this platform."""
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        return "macos"
 
-    Cheap and side-effect free: macOS platform + `osascript` on PATH. This
-    is a precondition check, not a delivery guarantee -- Notification
-    Center settings, Focus/Do Not Disturb, or per-app permissions can still
-    silently drop the notification even when this returns True.
-    """
-    return sys.platform == "darwin" and shutil.which("osascript") is not None
+    if sys.platform.startswith("linux") and shutil.which("notify-send"):
+        return "linux"
+
+    return None
+
+
+def available() -> bool:
+    """Whether a native notification backend is available."""
+    return _backend() is not None
 
 
 async def notify(title: str, message: str, *, subtitle: str = "") -> bool:
-    """Post a macOS notification. Returns whether it was handed off successfully.
-
-    This is a fallback path for when nobody is listening on the voice
-    channel, so it must never raise: any failure (no macOS, no osascript,
-    non-zero exit, timeout, spawn error) is logged as a warning and
-    reported back as False. The `osascript` call runs as a subprocess so it
-    never blocks the event loop, and is bounded by _TIMEOUT_SECONDS so a
-    wedged process cannot hang the caller.
-    """
+    """Post a native notification without ever raising into the caller."""
     try:
-        if not available():
+        backend = _backend()
+
+        if backend is None:
             log.warning("notifier: notifications unavailable on this platform")
             return False
 
@@ -92,23 +91,48 @@ async def notify(title: str, message: str, *, subtitle: str = "") -> bool:
         safe_subtitle = _truncate(str(subtitle or ""), _SUBTITLE_MAX)
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "osascript", "-", safe_title, safe_message, safe_subtitle,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            if backend == "macos":
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript",
+                    "-",
+                    safe_title,
+                    safe_message,
+                    safe_subtitle,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                communicate_input = _NOTIFY_SCRIPT.encode("utf-8")
+
+            else:
+                body = (
+                    f"{safe_subtitle}\n{safe_message}"
+                    if safe_subtitle
+                    else safe_message
+                )
+
+                proc = await asyncio.create_subprocess_exec(
+                    "notify-send",
+                    "--app-name",
+                    "JARVIS",
+                    safe_title,
+                    body,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                communicate_input = None
+
         except OSError as e:
-            log.warning(f"notifier: failed to spawn osascript: {e}")
+            log.warning(f"notifier: failed to spawn notification backend: {e}")
             return False
 
         try:
             _, stderr = await asyncio.wait_for(
-                proc.communicate(_NOTIFY_SCRIPT.encode("utf-8")),
+                proc.communicate(communicate_input),
                 timeout=_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            log.warning("notifier: osascript timed out, killing it")
+            log.warning("notifier: notification backend timed out, killing it")
             try:
                 proc.kill()
                 await proc.communicate()
@@ -118,13 +142,13 @@ async def notify(title: str, message: str, *, subtitle: str = "") -> bool:
 
         if proc.returncode != 0:
             log.warning(
-                f"notifier: osascript exited {proc.returncode}: "
+                f"notifier: backend exited {proc.returncode}: "
                 f"{stderr.decode(errors='replace').strip()}"
             )
             return False
 
         return True
+
     except Exception as e:
-        # Belt and suspenders: this path must never raise into the caller.
         log.warning(f"notifier: unexpected error posting notification: {e}")
         return False

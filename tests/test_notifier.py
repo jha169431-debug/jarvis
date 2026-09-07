@@ -54,7 +54,7 @@ def _patch_subprocess(fake_proc, capture=None):
 @pytest.mark.asyncio
 async def test_successful_post_returns_true():
     fake_proc = _FakeProcess(returncode=0)
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with _patch_subprocess(fake_proc):
             result = await notifier.notify("Title", "Message")
     assert result is True
@@ -63,15 +63,15 @@ async def test_successful_post_returns_true():
 @pytest.mark.asyncio
 async def test_nonzero_exit_returns_false_without_raising():
     fake_proc = _FakeProcess(returncode=1, stderr=b"some applescript error")
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with _patch_subprocess(fake_proc):
             result = await notifier.notify("Title", "Message")
     assert result is False
 
 
 @pytest.mark.asyncio
-async def test_missing_osascript_returns_false():
-    with patch("notifier.available", return_value=False):
+async def test_missing_backend_returns_false():
+    with patch("notifier._backend", return_value=None):
         result = await notifier.notify("Title", "Message")
     assert result is False
 
@@ -79,7 +79,7 @@ async def test_missing_osascript_returns_false():
 @pytest.mark.asyncio
 async def test_timeout_returns_false_without_raising():
     fake_proc = _FakeProcess(hang=True)
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with patch("notifier._TIMEOUT_SECONDS", 0.05):
             with _patch_subprocess(fake_proc):
                 result = await notifier.notify("Title", "Message")
@@ -92,14 +92,15 @@ async def test_spawn_failure_returns_false_without_raising():
     async def _raise(*args, **kwargs):
         raise OSError("no such file or directory: osascript")
 
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with patch("notifier.asyncio.create_subprocess_exec", side_effect=_raise):
             result = await notifier.notify("Title", "Message")
     assert result is False
 
 
-def test_available_false_on_non_darwin(monkeypatch):
-    monkeypatch.setattr(notifier.sys, "platform", "linux")
+def test_available_false_on_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(notifier.sys, "platform", "win32")
+    monkeypatch.setattr(notifier.shutil, "which", lambda name: None)
     assert notifier.available() is False
 
 
@@ -111,7 +112,27 @@ def test_available_false_when_osascript_missing(monkeypatch):
 
 def test_available_true_on_darwin_with_osascript(monkeypatch):
     monkeypatch.setattr(notifier.sys, "platform", "darwin")
-    monkeypatch.setattr(notifier.shutil, "which", lambda name: "/usr/bin/osascript")
+    monkeypatch.setattr(
+        notifier.shutil,
+        "which",
+        lambda name: "/usr/bin/osascript" if name == "osascript" else None,
+    )
+    assert notifier.available() is True
+
+
+def test_available_false_on_linux_without_notify_send(monkeypatch):
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    monkeypatch.setattr(notifier.shutil, "which", lambda name: None)
+    assert notifier.available() is False
+
+
+def test_available_true_on_linux_with_notify_send(monkeypatch):
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    monkeypatch.setattr(
+        notifier.shutil,
+        "which",
+        lambda name: "/usr/bin/notify-send" if name == "notify-send" else None,
+    )
     assert notifier.available() is True
 
 
@@ -137,7 +158,7 @@ INJECTION_PAYLOAD = '"; do shell script "touch ~/PWNED"; --\\ backslash " quote 
 async def test_injection_payload_reaches_boundary_as_literal_argv():
     fake_proc = _FakeProcess(returncode=0)
     capture = {}
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with _patch_subprocess(fake_proc, capture=capture):
             result = await notifier.notify(INJECTION_PAYLOAD, "a normal message")
 
@@ -163,7 +184,7 @@ async def test_quotes_and_backslashes_pass_through_unescaped_in_message():
     fake_proc = _FakeProcess(returncode=0)
     capture = {}
     payload = 'She said \\"hello\\" and left \\ trailing backslash'
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with _patch_subprocess(fake_proc, capture=capture):
             await notifier.notify("Title", payload)
 
@@ -177,7 +198,7 @@ async def test_long_text_is_truncated():
     capture = {}
     long_title = "T" * 500
     long_message = "M" * 500
-    with patch("notifier.available", return_value=True):
+    with patch("notifier._backend", return_value="macos"):
         with _patch_subprocess(fake_proc, capture=capture):
             await notifier.notify(long_title, long_message)
 
@@ -189,3 +210,54 @@ async def test_long_text_is_truncated():
     assert sent_message != long_message
     assert sent_title.endswith("…")
     assert sent_message.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_linux_notification_passes_untrusted_text_as_literal_argv():
+    """Linux notifications must never route untrusted text through a shell."""
+    fake_proc = _FakeProcess(returncode=0)
+    capture = {}
+
+    title = INJECTION_PAYLOAD
+    message = 'message "$(touch /tmp/PWNED)" `id` ; rm -rf nope'
+    subtitle = 'subtitle; echo nope'
+
+    with patch("notifier._backend", return_value="linux"):
+        with _patch_subprocess(fake_proc, capture=capture):
+            result = await notifier.notify(
+                title,
+                message,
+                subtitle=subtitle,
+            )
+
+    assert result is True
+
+    args = capture["args"]
+    kwargs = capture["kwargs"]
+
+    assert args[0] == "notify-send"
+    assert args[1:3] == ("--app-name", "JARVIS")
+    assert args[3] == title
+    assert args[4] == f"{subtitle}\n{message}"
+
+    # create_subprocess_exec receives argv directly. Nothing is interpreted
+    # by /bin/sh, bash, AppleScript, or another command language.
+    assert fake_proc.sent_stdin is None
+    assert "shell" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_linux_notification_without_subtitle_uses_message_as_body():
+    fake_proc = _FakeProcess(returncode=0)
+    capture = {}
+
+    with patch("notifier._backend", return_value="linux"):
+        with _patch_subprocess(fake_proc, capture=capture):
+            result = await notifier.notify("Title", "Message")
+
+    assert result is True
+    args = capture["args"]
+
+    assert args[0] == "notify-send"
+    assert args[3] == "Title"
+    assert args[4] == "Message"
