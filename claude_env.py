@@ -49,10 +49,47 @@ STREAM_LINE_LIMIT = 64 * 1024 * 1024  # 64 MiB per line
 
 
 def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
-    """A copy of the environment with everything that would redirect or
-    re-bill a Claude Code child removed. Everything else — PATH, HOME,
-    CLAUDE_CONFIG_DIR, the user's own variables — passes through untouched."""
+    """Build the environment for every Claude Code child.
+
+    Default behavior preserves upstream JARVIS semantics: Anthropic/Claude
+    redirect variables are scrubbed so the user's subscription is used.
+
+    When JARVIS_LLM_PROVIDER=ollama, explicitly route Claude Code through
+    the local Ollama Anthropic-compatible endpoint instead.
+    """
     source = os.environ if base is None else base
-    return {k: v for k, v in source.items()
-            if not k.startswith(SCRUBBED_ENV_PREFIXES)
-            and k not in SCRUBBED_ENV_KEYS}
+
+    env = {
+        k: v for k, v in source.items()
+        if not k.startswith(SCRUBBED_ENV_PREFIXES)
+        and k not in SCRUBBED_ENV_KEYS
+    }
+
+    provider = source.get("JARVIS_LLM_PROVIDER", "").strip().lower()
+
+    if provider == "ollama":
+        model = source.get("JARVIS_LOCAL_MODEL", "qwen3.5:4b")
+        base_url = source.get(
+            "JARVIS_OLLAMA_URL",
+            "http://127.0.0.1:11434",
+        )
+        context = source.get("JARVIS_OLLAMA_CONTEXT", "32768")
+
+        env.update({
+            "ANTHROPIC_AUTH_TOKEN": "ollama",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_BASE_URL": base_url,
+
+            # Keep JARVIS using Claude's normal aliases while routing all
+            # aliases to the selected local Ollama model.
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+
+            # Claude Code cannot infer the context window of arbitrary
+            # provider model IDs.
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": context,
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
+        })
+
+    return env
