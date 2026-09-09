@@ -270,6 +270,19 @@ async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     check stays OK (matching prior behaviour) but says so honestly rather
     than implying a guarantee it cannot make.
     """
+    env = claude_env.child_env()
+
+    if env.get("JARVIS_LLM_PROVIDER", "").strip().lower() == "ollama":
+        model = env.get("JARVIS_LOCAL_MODEL", "local model")
+        return Check(
+            name="claude_login",
+            status=STATUS_OK,
+            message=(
+                "Claude subscription login is not required: "
+                f"JARVIS is using Ollama with {model}."
+            ),
+        )
+
     claude = shutil.which("claude")
     if not claude:
         return Check(
@@ -279,7 +292,6 @@ async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
             remedy="Install Claude Code and log in with `claude`.",
         )
 
-    env = claude_env.child_env()
     config_dir = _config_dir_from_env(env)
     where = f"config dir: {config_dir}"
 
@@ -335,6 +347,67 @@ async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     return Check(name="claude_login", status=STATUS_OK, message=message)
 
 
+async def _check_ollama_backend(
+        timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
+    """Verify the selected local Ollama backend without spending a model turn."""
+
+    env = claude_env.child_env()
+    if env.get("JARVIS_LLM_PROVIDER", "").strip().lower() != "ollama":
+        return Check(
+            name="ollama_backend",
+            status=STATUS_OK,
+            message="Ollama backend is not selected.",
+        )
+
+    ollama = shutil.which("ollama")
+    if not ollama:
+        return Check(
+            name="ollama_backend",
+            status=STATUS_FAIL,
+            message="Ollama is selected but `ollama` is not on PATH.",
+            remedy="Install Ollama and make sure the `ollama` command is on PATH.",
+        )
+
+    rc, stdout, stderr = await _run_subprocess(
+        ollama, "list", timeout=timeout, env=env)
+
+    if rc != 0:
+        return Check(
+            name="ollama_backend",
+            status=STATUS_FAIL,
+            message=(
+                "Ollama is selected but its local service could not be reached: "
+                f"{(stderr or stdout).strip() or f'exit {rc}'}"
+            ),
+            remedy="Start the Ollama service and verify `ollama list` works.",
+        )
+
+    model = env.get("JARVIS_LOCAL_MODEL", "").strip()
+    if model:
+        installed = {
+            line.split()[0]
+            for line in stdout.splitlines()[1:]
+            if line.split()
+        }
+        if model not in installed:
+            return Check(
+                name="ollama_backend",
+                status=STATUS_FAIL,
+                message=f"Ollama is running, but model {model!r} is not installed.",
+                remedy=f"Run `ollama pull {model}`.",
+            )
+
+    return Check(
+        name="ollama_backend",
+        status=STATUS_OK,
+        message=(
+            f"Ollama is reachable and {model!r} is available."
+            if model else
+            "Ollama is reachable."
+        ),
+    )
+
+
 # macOS's own wording (and error code) for "Accessibility not granted" --
 # distinctive enough it can't match an ordinary AppleScript error. Mirrors
 # dialog.py's _PERMISSION_MARKERS, which sees the sibling "-1743"/"-25211"
@@ -356,11 +429,18 @@ async def _check_accessibility(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
     macOS version, this comes back as a WARN (unrecognised error) rather
     than mis-reporting OK, so it fails safe.
     """
-    if sys.platform != "darwin" or not shutil.which("osascript"):
+    if sys.platform != "darwin":
+        return Check(
+            name="accessibility",
+            status=STATUS_OK,
+            message="Accessibility permission is macOS-only and is not required here.",
+        )
+
+    if not shutil.which("osascript"):
         return Check(
             name="accessibility",
             status=STATUS_WARN,
-            message="Cannot check Accessibility: not macOS, or osascript is missing.",
+            message="Cannot check Accessibility because osascript is missing.",
         )
 
     rc, stdout, stderr = await _run_subprocess(
@@ -411,6 +491,13 @@ def _check_screen_recording_sync() -> Check:
     one) and NEVER captures anything to find out -- a screenshot the user did
     not ask for, at every boot, is precisely what this capability must not do.
     """
+    if sys.platform != "darwin":
+        return Check(
+            name="screen_recording",
+            status=STATUS_OK,
+            message="Screen Recording permission is macOS-only and is not required here.",
+        )
+
     try:
         granted = screen.screen_recording_granted()
     except Exception as e:  # the module must never take startup down
@@ -435,6 +522,60 @@ def _check_screen_recording_sync() -> Check:
             "Grant that app Screen Recording under System Settings -> Privacy "
             "& Security -> Screen & System Audio Recording, then RESTART it: "
             "the grant only reaches a process started after it was given."
+        ),
+    )
+
+
+def _check_linux_desktop_sync() -> Check:
+    """Capabilities required by the current Linux/X11 desktop backend."""
+
+    if not sys.platform.startswith("linux"):
+        return Check(
+            name="linux_desktop",
+            status=STATUS_OK,
+            message="Linux desktop backend is not in use.",
+        )
+
+    session = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+    display = os.environ.get("DISPLAY", "").strip()
+
+    if session and session != "x11":
+        return Check(
+            name="linux_desktop",
+            status=STATUS_FAIL,
+            message=(
+                f"Linux session type is {session!r}; the current JARVIS "
+                "desktop backend requires X11."
+            ),
+            remedy="Run JARVIS from an X11 session.",
+        )
+
+    if not display:
+        return Check(
+            name="linux_desktop",
+            status=STATUS_FAIL,
+            message="DISPLAY is not set; JARVIS cannot access the X11 desktop.",
+            remedy="Start JARVIS from inside your graphical X11 session.",
+        )
+
+    required = ("wmctrl", "xprop", "gnome-screenshot", "ffmpeg")
+    missing = [name for name in required if not shutil.which(name)]
+
+    if missing:
+        joined = ", ".join(missing)
+        return Check(
+            name="linux_desktop",
+            status=STATUS_FAIL,
+            message=f"Linux desktop tools missing: {joined}.",
+            remedy=f"Install the missing desktop tools: {joined}.",
+        )
+
+    return Check(
+        name="linux_desktop",
+        status=STATUS_OK,
+        message=(
+            "Linux/X11 desktop backend is ready: "
+            "wmctrl, xprop, gnome-screenshot and ffmpeg are available."
         ),
     )
 
@@ -626,9 +767,19 @@ def enable_cross_session_inbound() -> tuple[bool, str]:
 
 # ── running them all ─────────────────────────────────────────────────────
 
-_ASYNC_CHECKS = (_check_claude_cli, _check_claude_login, _check_accessibility)
-_SYNC_CHECKS = (_check_fish_api_key_sync, _check_anthropic_key_leftover_sync,
-                _check_cross_session_inbound_sync, _check_screen_recording_sync)
+_ASYNC_CHECKS = (
+    _check_claude_cli,
+    _check_claude_login,
+    _check_ollama_backend,
+    _check_accessibility,
+)
+_SYNC_CHECKS = (
+    _check_fish_api_key_sync,
+    _check_anthropic_key_leftover_sync,
+    _check_cross_session_inbound_sync,
+    _check_screen_recording_sync,
+    _check_linux_desktop_sync,
+)
 
 
 async def _run_one(fn, *, is_async: bool, timeout: float) -> Check:
@@ -685,6 +836,10 @@ def _phrase_for(check: Check) -> str:
         if "not logged in" in msg:
             return "Claude Code isn't logged in"
         return "Claude Code's login couldn't be checked"
+    if name == "ollama_backend":
+        return "the local Ollama backend isn't ready"
+    if name == "linux_desktop":
+        return "the Linux desktop backend isn't ready"
     if name == "accessibility":
         if "not granted Accessibility" in msg:
             return "I don't have Accessibility permission"

@@ -147,6 +147,7 @@ async def test_claude_logged_in(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_claude_login_check_without_claude_on_path(monkeypatch):
+    monkeypatch.setattr(preflight.claude_env, "child_env", lambda: {})
     monkeypatch.setattr(preflight.shutil, "which", lambda name: None)
     check = await preflight._check_claude_login()
     assert check.status == STATUS_WARN
@@ -324,7 +325,8 @@ async def test_accessibility_unknown_error_is_warn_not_ok(monkeypatch):
 async def test_accessibility_skipped_off_darwin(monkeypatch):
     monkeypatch.setattr(preflight.sys, "platform", "linux")
     check = await preflight._check_accessibility()
-    assert check.status == STATUS_WARN
+    assert check.status == STATUS_OK
+    assert check.remedy is None
 
 
 # --- Screen Recording ----------------------------------------------------------
@@ -335,6 +337,7 @@ async def test_accessibility_skipped_off_darwin(monkeypatch):
 # it is worth saying at startup rather than at the moment he asks.
 
 def test_screen_recording_granted(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "darwin")
     monkeypatch.setattr(preflight.screen, "screen_recording_granted", lambda: True)
     check = preflight._check_screen_recording_sync()
     assert check.status == STATUS_OK
@@ -342,6 +345,7 @@ def test_screen_recording_granted(monkeypatch):
 
 
 def test_screen_recording_not_granted_is_fail_with_the_launching_app_remedy(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "darwin")
     monkeypatch.setattr(preflight.screen, "screen_recording_granted", lambda: False)
     check = preflight._check_screen_recording_sync()
     assert check.status == STATUS_FAIL
@@ -351,6 +355,7 @@ def test_screen_recording_not_granted_is_fail_with_the_launching_app_remedy(monk
 
 
 def test_screen_recording_undeterminable_is_warn_not_fail(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "darwin")
     """None means the probe could not run -- off macOS, or a macOS that moved
     the symbol. Reporting that as a missing permission would send the user to
     a settings pane over nothing."""
@@ -360,6 +365,7 @@ def test_screen_recording_undeterminable_is_warn_not_fail(monkeypatch):
 
 
 def test_screen_recording_check_never_raises(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "darwin")
     def boom():
         raise RuntimeError("CoreGraphics went sideways")
 
@@ -369,6 +375,7 @@ def test_screen_recording_check_never_raises(monkeypatch):
 
 
 def test_the_startup_check_never_takes_a_picture(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "darwin")
     """Preflight asks the OS a question. It does NOT capture the screen to
     find out -- that would be a screenshot the user never asked for, at every
     boot."""
@@ -522,8 +529,15 @@ async def test_run_checks_runs_all_registered_checks(monkeypatch):
     results = await preflight.run_checks(timeout=1.0)
     names = {c.name for c in results}
     assert names == {
-        "claude_cli", "claude_login", "accessibility", "screen_recording",
-        "fish_api_key", "anthropic_key_leftover", "cross_session_inbound",
+        "claude_cli",
+        "claude_login",
+        "ollama_backend",
+        "accessibility",
+        "screen_recording",
+        "linux_desktop",
+        "fish_api_key",
+        "anthropic_key_leftover",
+        "cross_session_inbound",
     }
 
 
@@ -596,3 +610,140 @@ def test_spoken_summary_warn_counts_as_something_wrong():
     summary = preflight.spoken_summary(checks)
     assert summary != ""
     assert "One thing needs attention" in summary
+
+
+# --- Ollama provider -----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ollama_provider_does_not_require_claude_login(monkeypatch):
+    monkeypatch.setattr(
+        preflight.claude_env,
+        "child_env",
+        lambda: {
+            "JARVIS_LLM_PROVIDER": "ollama",
+            "JARVIS_LOCAL_MODEL": "qwen3.5:4b",
+        },
+    )
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Claude auth must not run in Ollama mode")
+
+    monkeypatch.setattr(preflight, "_run_subprocess", forbidden)
+
+    check = await preflight._check_claude_login()
+
+    assert check.status == STATUS_OK
+    assert "not required" in check.message
+
+
+@pytest.mark.asyncio
+async def test_ollama_backend_model_is_available(monkeypatch):
+    monkeypatch.setattr(
+        preflight.claude_env,
+        "child_env",
+        lambda: {
+            "JARVIS_LLM_PROVIDER": "ollama",
+            "JARVIS_LOCAL_MODEL": "qwen3.5:4b",
+        },
+    )
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: "/usr/bin/ollama" if name == "ollama" else None,
+    )
+
+    async def fake_run(*args, timeout, env=None):
+        assert args == ("/usr/bin/ollama", "list")
+        return (
+            0,
+            "NAME             ID          SIZE\n"
+            "qwen3.5:4b       abc123      3.4 GB\n",
+            "",
+        )
+
+    monkeypatch.setattr(preflight, "_run_subprocess", fake_run)
+
+    check = await preflight._check_ollama_backend()
+
+    assert check.status == STATUS_OK
+    assert "qwen3.5:4b" in check.message
+
+
+@pytest.mark.asyncio
+async def test_ollama_backend_missing_model_fails(monkeypatch):
+    monkeypatch.setattr(
+        preflight.claude_env,
+        "child_env",
+        lambda: {
+            "JARVIS_LLM_PROVIDER": "ollama",
+            "JARVIS_LOCAL_MODEL": "qwen3.5:4b",
+        },
+    )
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: "/usr/bin/ollama" if name == "ollama" else None,
+    )
+
+    async def fake_run(*args, timeout, env=None):
+        return (
+            0,
+            "NAME             ID          SIZE\n"
+            "llama3:8b        abc123      4.7 GB\n",
+            "",
+        )
+
+    monkeypatch.setattr(preflight, "_run_subprocess", fake_run)
+
+    check = await preflight._check_ollama_backend()
+
+    assert check.status == STATUS_FAIL
+    assert "not installed" in check.message
+
+
+# --- Linux desktop -------------------------------------------------------------
+
+def test_linux_desktop_ready(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    monkeypatch.setenv("DISPLAY", ":0")
+
+    tools = {"wmctrl", "xprop", "gnome-screenshot", "ffmpeg"}
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in tools else None,
+    )
+
+    check = preflight._check_linux_desktop_sync()
+
+    assert check.status == STATUS_OK
+    assert check.remedy is None
+
+
+def test_linux_desktop_missing_tool_fails(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    monkeypatch.setenv("DISPLAY", ":0")
+
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: None if name == "wmctrl" else f"/usr/bin/{name}",
+    )
+
+    check = preflight._check_linux_desktop_sync()
+
+    assert check.status == STATUS_FAIL
+    assert "wmctrl" in check.message
+
+
+def test_linux_desktop_rejects_wayland_for_current_backend(monkeypatch):
+    monkeypatch.setattr(preflight.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("DISPLAY", ":0")
+
+    check = preflight._check_linux_desktop_sync()
+
+    assert check.status == STATUS_FAIL
+    assert "X11" in check.message
