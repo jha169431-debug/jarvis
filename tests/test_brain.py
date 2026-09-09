@@ -479,6 +479,7 @@ def test_child_env_never_carries_api_credentials(monkeypatch):
     """The server's .env puts ANTHROPIC_API_KEY in the environment for other
     features; the brain must never inherit it or the CLI bills the key (and,
     with an identity-linked key, fails with '400 anthropic-workspace-id')."""
+    monkeypatch.delenv("JARVIS_LLM_PROVIDER", raising=False)
     import brain
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-identity-linked")
     monkeypatch.setenv("ANTHROPIC_WORKSPACE_ID", "wrkspc_x")

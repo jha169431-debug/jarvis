@@ -3616,10 +3616,11 @@ async def _perform_dialog(item: _StagedDialog) -> None:
         if speech is None:
             record("no_voice")             # the mouth went away between turns
             return
-        # The read-back names the key AND warns about the focus theft, because
-        # the window coming forward is the part that interrupts the user.
+        # The read-back names the key and warns that the addressed terminal
+        # may become visible. macOS Terminal can come forward; a Linux tmux
+        # target is addressed directly and normally does not steal focus.
         utt = await speech.say(
-            f"Pressing {said} on {_said_name(item)} — this will bring that "
+            f"Pressing {said} on {_said_name(item)} — this may bring its "
             f"window forward.", Priority.NORMAL)
         heard = await speech.wait_for(utt, timeout=READBACK_TIMEOUT)
         if utt.was_cancelled:
@@ -3644,9 +3645,8 @@ async def _perform_dialog(item: _StagedDialog) -> None:
                              Priority.NORMAL)
         elif outcome == dialog.NOT_FOUND:
             await speech.say(
-                f"{_said_name(item)} isn't in a Terminal window I can reach, "
-                f"sir — another application is hosting it, so that one needs "
-                f"your own hand.", Priority.NORMAL)
+                f"{_said_name(item)} isn't in a terminal session I can safely "
+                f"reach, sir — that one needs your own hand.", Priority.NORMAL)
         elif outcome == dialog.NOT_PERMITTED:
             await speech.say(
                 "macOS won't let me send keystrokes, sir — I'd need accessibility "
@@ -3708,9 +3708,9 @@ async def tool_answer_dialog(args: dict) -> str:
     Three validations, all synchronous and all refusals rather than guesses:
     the session must resolve to exactly one conversation, that conversation
     must have exactly one controlling terminal, and the key must be inside
-    `dialog`'s closed vocabulary. Whether a Terminal.app tab actually owns
-    that tty is NOT decided here — that needs AppleScript, and it is the
-    staged phase's job.
+    `dialog`'s closed vocabulary. Whether a supported terminal backend
+    actually owns that tty is NOT decided here; the staged phase revalidates
+    the terminal identity immediately before any key is sent.
     """
     name = str(args.get("name") or "")
     raw_key = str(args.get("key") or "")
@@ -3722,8 +3722,8 @@ async def tool_answer_dialog(args: dict) -> str:
 
     key = dialog.normalize_key(raw_key)
     if key is None:
-        # Refused before anything is staged, and long before any AppleScript
-        # exists. JARVIS presses keys, he does not type: there is no
+        # Refused before anything is staged, and long before any terminal
+        # input operation exists. JARVIS presses keys, he does not type: there is no
         # best-effort reading of free text, and asking for one is the answer.
         run_store.record_steer(session.session_id, session.voice_name,
                                session.project, raw_key, "dialog:bad_key")
@@ -3753,8 +3753,8 @@ async def tool_answer_dialog(args: dict) -> str:
                                 project=session.project, pid=pid, key=key))
     return (f"staged — I'll say what I'm about to press and then press "
             f"{dialog.spoken_key(key)} on {_said_name(session)} the moment this "
-            f"turn ends, unless he stops me. It only works if that session is "
-            f"in a Terminal window; if it isn't, he'll be told. Say briefly "
+            f"turn ends, unless he stops me. It only works if that terminal "
+            f"session can be safely addressed; if it can't, he'll be told. Say briefly "
             f"that it is going out and end your turn; do not call this tool "
             f"again for it.")
 

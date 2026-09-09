@@ -79,6 +79,9 @@ async def test_a_refused_key_never_reaches_applescript(raw, monkeypatch):
 def test_a_tty_is_normalized_to_its_device_path():
     assert dialog.normalize_tty("ttys006") == "/dev/ttys006"
     assert dialog.normalize_tty("/dev/ttys006") == "/dev/ttys006"
+    assert dialog.normalize_tty("pts/5") == "/dev/pts/5"
+    assert dialog.normalize_tty("/dev/pts/5") == "/dev/pts/5"
+    assert dialog.normalize_tty("/dev/pts/not-a-number") is None
     assert dialog.normalize_tty("??") is None
     assert dialog.normalize_tty("") is None
     assert dialog.normalize_tty(None) is None
@@ -101,6 +104,7 @@ def _enumeration(*rows):
 @pytest.fixture
 def fake_osascript(monkeypatch):
     """Records every script and replays queued (rc, stdout, stderr) results."""
+    monkeypatch.setattr(dialog.sys, "platform", "darwin")
     calls = []
     results = []
 
@@ -778,6 +782,7 @@ async def test_a_slow_ps_does_not_freeze_the_loop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_slow_pgrep_does_not_freeze_the_loop(monkeypatch):
+    monkeypatch.setattr(dialog.sys, "platform", "darwin")
     monkeypatch.setattr(dialog, "tty_for_pid", lambda pid: "/dev/ttys006")
 
     def slow():
@@ -797,3 +802,144 @@ def test_the_ps_timeout_bounds_a_synchronous_caller(monkeypatch):
     ceiling is what bounds the damage: a five-process session at 5s each was
     up to 25 seconds of frozen microphone."""
     assert dialog._PS_TIMEOUT <= 2.0
+
+
+# --- Linux tmux backend -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_linux_without_tmux_fails_closed(monkeypatch):
+    monkeypatch.setattr(dialog.sys, "platform", "linux")
+    monkeypatch.setattr(dialog, "tty_for_pid",
+                        lambda pid: "/dev/pts/5")
+    monkeypatch.setattr(dialog.shutil, "which",
+                        lambda name: None if name == "tmux" else f"/usr/bin/{name}")
+
+    assert await dialog.answer(4242, "return") == dialog.NOT_FOUND
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key,send_tail", [
+    ("return", ("send-keys", "-t", "%7", "Enter")),
+    ("escape", ("send-keys", "-t", "%7", "Escape")),
+    ("2", ("send-keys", "-l", "-t", "%7", "2")),
+])
+async def test_linux_tmux_sends_only_to_exact_verified_pane(
+        key, send_tail, monkeypatch):
+    monkeypatch.setattr(dialog.sys, "platform", "linux")
+    monkeypatch.setattr(dialog.shutil, "which",
+                        lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(dialog, "tty_for_pid",
+                        lambda pid: "/dev/pts/5")
+    monkeypatch.setattr(
+        dialog, "_proc_tmux_env",
+        lambda pid: {
+            "TMUX": "/tmp/tmux-1000/default,1234,0",
+            "TMUX_PANE": "%7",
+        })
+
+    calls = []
+
+    async def fake_tmux(socket, *args, timeout=dialog._TMUX_TIMEOUT):
+        calls.append((socket, args))
+        if args and args[0] == "display-message":
+            return 0, "1234 %7 /dev/pts/5 0 0\n", ""
+        if args and args[0] == "send-keys":
+            return 0, "", ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(dialog, "_run_tmux", fake_tmux)
+
+    assert await dialog.answer(4242, key) == dialog.SENT
+    assert calls[-1] == (
+        "/tmp/tmux-1000/default",
+        send_tail,
+    )
+
+    # One check before the process re-read, one immediately before send.
+    state_checks = [args for _, args in calls if args[0] == "display-message"]
+    assert len(state_checks) == 2
+
+
+@pytest.mark.asyncio
+async def test_linux_tmux_refuses_a_pane_with_the_wrong_tty(monkeypatch):
+    monkeypatch.setattr(dialog.sys, "platform", "linux")
+    monkeypatch.setattr(dialog.shutil, "which",
+                        lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(dialog, "tty_for_pid",
+                        lambda pid: "/dev/pts/5")
+    monkeypatch.setattr(
+        dialog, "_proc_tmux_env",
+        lambda pid: {
+            "TMUX": "/tmp/tmux-1000/default,1234,0",
+            "TMUX_PANE": "%7",
+        })
+
+    calls = []
+
+    async def fake_tmux(socket, *args, timeout=dialog._TMUX_TIMEOUT):
+        calls.append(args)
+        return 0, "1234 %7 /dev/pts/6 0 0\n", ""
+
+    monkeypatch.setattr(dialog, "_run_tmux", fake_tmux)
+
+    assert await dialog.answer(4242, "return") == dialog.NOT_FOUND
+    assert not any(args[0] == "send-keys" for args in calls)
+
+
+@pytest.mark.asyncio
+async def test_linux_tmux_refuses_when_process_moves_panes(monkeypatch):
+    monkeypatch.setattr(dialog.sys, "platform", "linux")
+    monkeypatch.setattr(dialog.shutil, "which",
+                        lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(dialog, "tty_for_pid",
+                        lambda pid: "/dev/pts/5")
+
+    envs = [
+        {
+            "TMUX": "/tmp/tmux-1000/default,1234,0",
+            "TMUX_PANE": "%7",
+        },
+        {
+            "TMUX": "/tmp/tmux-1000/default,1234,0",
+            "TMUX_PANE": "%8",
+        },
+    ]
+
+    monkeypatch.setattr(dialog, "_proc_tmux_env",
+                        lambda pid: envs.pop(0))
+
+    calls = []
+
+    async def fake_tmux(socket, *args, timeout=dialog._TMUX_TIMEOUT):
+        calls.append(args)
+        if args[0] == "display-message":
+            return 0, "1234 %7 /dev/pts/5 0 0\n", ""
+        raise AssertionError("send-keys must not run after pane identity changes")
+
+    monkeypatch.setattr(dialog, "_run_tmux", fake_tmux)
+
+    assert await dialog.answer(4242, "return") == dialog.NOT_FOUND
+    assert not any(args[0] == "send-keys" for args in calls)
+
+
+@pytest.mark.asyncio
+async def test_linux_tmux_refuses_copy_mode_or_disabled_input(monkeypatch):
+    monkeypatch.setattr(dialog.sys, "platform", "linux")
+    monkeypatch.setattr(dialog.shutil, "which",
+                        lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(dialog, "tty_for_pid",
+                        lambda pid: "/dev/pts/5")
+    monkeypatch.setattr(
+        dialog, "_proc_tmux_env",
+        lambda pid: {
+            "TMUX": "/tmp/tmux-1000/default,1234,0",
+            "TMUX_PANE": "%7",
+        })
+
+    async def fake_tmux(socket, *args, timeout=dialog._TMUX_TIMEOUT):
+        return 0, "1234 %7 /dev/pts/5 1 0\n", ""
+
+    monkeypatch.setattr(dialog, "_run_tmux", fake_tmux)
+
+    assert await dialog.answer(4242, "return") == dialog.NOT_FOUND

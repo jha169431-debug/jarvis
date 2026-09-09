@@ -384,6 +384,14 @@ PRINTERS = _functions_that_print_a_foreign_field()
 # to-do: every one of them is a place where a session's own words DO reach a
 # string, and the argument is why that string is safe.
 EXEMPT = {
+    "dialog._tmux_state_matches": (
+        "it only compares structural tmux identifiers — server PID, pane ID "
+        "and pane TTY — and logs tmux diagnostics. None of those values are "
+        "session-authored prose returned to the brain or spoken to the user"),
+    "dialog._answer_linux_tmux": (
+        "it only handles PID, TTY and tmux pane identity plus fixed outcome "
+        "strings. Session-authored text is never rendered into trusted JARVIS "
+        "output, speech, or a prompt by this function"),
     "server._session_line": (
         "it prints `summary()` — another session's own words — with no "
         "escaping at all, and that is correct only because every caller puts "

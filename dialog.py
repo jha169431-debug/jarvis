@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 log = logging.getLogger("jarvis.dialog")
 
@@ -103,6 +106,16 @@ class TerminalTab:
     tty: str
 
 
+@dataclass(frozen=True)
+class TmuxPane:
+    """Exact Linux tmux target derived from the target process itself."""
+    socket_path: str
+    server_pid: int
+    pane_id: str
+    tty: str
+    tmux_env: str
+
+
 def normalize_key(key) -> str | None:
     """The closed vocabulary, or None. None means REFUSE — never interpret.
 
@@ -136,9 +149,13 @@ def normalize_tty(tty: str | None) -> str | None:
         return None
     if not t.startswith("/dev/"):
         t = "/dev/" + t
-    # A device path and nothing else. Anything stranger is not a tty we will
-    # act on, and refusing here keeps unvetted text out of the AppleScript.
-    return t if re.fullmatch(r"/dev/tty[a-zA-Z0-9]+", t) else None
+    # macOS Terminal uses /dev/ttysNNN. Linux pseudoterminals use
+    # /dev/pts/N. Accept only those exact device-path shapes.
+    if re.fullmatch(r"/dev/tty[a-zA-Z0-9]+", t):
+        return t
+    if re.fullmatch(r"/dev/pts/[0-9]+", t):
+        return t
+    return None
 
 
 def tty_for_pid(pid) -> str | None:
@@ -228,6 +245,193 @@ async def _osascript(script: str, timeout: float) -> tuple[int, str, str]:
 def _is_permission_error(stderr: str) -> bool:
     low = stderr.lower()
     return any(m in low for m in _PERMISSION_MARKERS)
+
+
+_TMUX_PANE_RE = re.compile(r"%[0-9]+")
+_TMUX_TIMEOUT = 2.0
+
+
+def _proc_tmux_env(pid) -> dict[str, str] | None:
+    """Read only the tmux identity variables from a Linux process.
+
+    The target process is the authority for which tmux server and pane it was
+    born in. Nothing from JARVIS's own ambient TMUX environment is used.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+
+    try:
+        data = Path(f"/proc/{pid}/environ").read_bytes()
+    except (OSError, ValueError):
+        return None
+
+    out: dict[str, str] = {}
+    for item in data.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, _, value = item.partition(b"=")
+        if key == b"TMUX":
+            out["TMUX"] = os.fsdecode(value)
+        elif key == b"TMUX_PANE":
+            try:
+                out["TMUX_PANE"] = value.decode("ascii")
+            except UnicodeDecodeError:
+                return None
+    return out
+
+
+def _tmux_target_from_env(env: dict[str, str] | None,
+                          tty: str | None) -> TmuxPane | None:
+    """Parse a strict tmux identity and bind it to exactly one tty."""
+    if not env:
+        return None
+
+    raw_tmux = env.get("TMUX", "")
+    pane_id = env.get("TMUX_PANE", "")
+    want_tty = normalize_tty(tty)
+
+    if want_tty is None or _TMUX_PANE_RE.fullmatch(pane_id) is None:
+        return None
+
+    # TMUX is socket-path,server-pid,session-index. rsplit keeps commas in a
+    # socket path from changing which two fields are treated as metadata.
+    parts = raw_tmux.rsplit(",", 2)
+    if len(parts) != 3:
+        return None
+
+    socket_path, server_pid_text, session_index = parts
+    if not socket_path or not Path(socket_path).is_absolute():
+        return None
+    if not server_pid_text.isdecimal() or not session_index.isdecimal():
+        return None
+
+    server_pid = int(server_pid_text)
+    if server_pid <= 0:
+        return None
+
+    return TmuxPane(
+        socket_path=socket_path,
+        server_pid=server_pid,
+        pane_id=pane_id,
+        tty=want_tty,
+        tmux_env=raw_tmux,
+    )
+
+
+async def _run_tmux(socket_path: str, *args: str,
+                    timeout: float = _TMUX_TIMEOUT) -> tuple[int, str, str]:
+    """Run tmux against one explicit server socket. Never invokes a shell."""
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return 127, "", "tmux not installed"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux, "-S", socket_path, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            return -1, "", "timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+    return (
+        proc.returncode or 0,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace"),
+    )
+
+
+async def _tmux_state_matches(target: TmuxPane) -> bool:
+    """Revalidate server, pane, tty and input state in one tmux query."""
+    code, stdout, stderr = await _run_tmux(
+        target.socket_path,
+        "display-message",
+        "-p",
+        "-t",
+        target.pane_id,
+        "#{pid} #{pane_id} #{pane_tty} #{pane_in_mode} #{pane_input_off}",
+    )
+    if code != 0:
+        log.warning(
+            f"tmux pane lookup failed ({code}): {stderr.strip()}")
+        return False
+
+    parts = stdout.strip().split()
+    if len(parts) != 5:
+        return False
+
+    server_pid, pane_id, pane_tty, pane_in_mode, pane_input_off = parts
+    return (
+        server_pid == str(target.server_pid)
+        and pane_id == target.pane_id
+        and normalize_tty(pane_tty) == target.tty
+        and pane_in_mode == "0"
+        and pane_input_off == "0"
+    )
+
+
+async def _answer_linux_tmux(pid: int, tty: str,
+                             normalized: str) -> str:
+    """Send one key only to a positively identified tmux pane.
+
+    Ordinary GNOME Terminal deliberately returns NOT_FOUND: its D-Bus screen
+    object identifies the tab but does not expose a safe input method.
+    """
+    if shutil.which("tmux") is None:
+        return NOT_FOUND
+
+    env = await asyncio.to_thread(_proc_tmux_env, pid)
+    target = _tmux_target_from_env(env, tty)
+    if target is None:
+        return NOT_FOUND
+
+    # First identity check.
+    if not await _tmux_state_matches(target):
+        return NOT_FOUND
+
+    # Re-read the process itself immediately before the send. Its tty, TMUX
+    # server or pane may have changed since lookup.
+    current_tty = await tty_for_pid_async(pid)
+    if current_tty != target.tty:
+        return NOT_FOUND
+
+    current_env = await asyncio.to_thread(_proc_tmux_env, pid)
+    current_target = _tmux_target_from_env(current_env, current_tty)
+    if current_target != target:
+        return NOT_FOUND
+
+    # Second tmux-side identity check immediately before send-keys.
+    if not await _tmux_state_matches(target):
+        return NOT_FOUND
+
+    if normalized == "return":
+        args = ("send-keys", "-t", target.pane_id, "Enter")
+    elif normalized == "escape":
+        args = ("send-keys", "-t", target.pane_id, "Escape")
+    else:
+        # Digits are literal characters, never tmux key names.
+        args = ("send-keys", "-l", "-t", target.pane_id, normalized)
+
+    code, _, stderr = await _run_tmux(target.socket_path, *args)
+    if code == 0:
+        return SENT
+
+    log.warning(f"tmux send-keys failed ({code}): {stderr.strip()}")
+    return FAILED
 
 
 _ENUMERATE_SCRIPT = '''
@@ -349,44 +553,60 @@ return "ok"
 async def answer(pid: int, key: str) -> str:
     """Press one key in the terminal that owns `pid`. Never raises.
 
-    Returns `sent`, `no_tty`, `not_found`, `not_permitted`, `failed`, or —
-    defensively, for a caller that skipped its own validation — `bad_key`.
-    Only `sent` means a keystroke actually left this machine's event queue.
+    macOS targets an exact Terminal.app tab by tty. Linux targets only an
+    exact tmux pane whose tty is proven to equal the process tty. Other
+    terminal hosts fail closed as `not_found`.
+
+    Only `sent` means an input event was actually delivered.
     """
     normalized = normalize_key(key)
     if normalized is None:
-        # Before any script is composed: nothing about the rejected key ever
-        # reaches AppleScript, so there is nothing to escape and nothing to
-        # get wrong.
         log.warning(f"refusing a key outside the vocabulary: {key!r}")
         return BAD_KEY
+
     try:
         tty = await tty_for_pid_async(pid)
         if tty is None:
             return NO_TTY
+
+        if sys.platform.startswith("linux"):
+            return await _answer_linux_tmux(pid, tty, normalized)
+
+        if sys.platform != "darwin":
+            return NOT_FOUND
+
+        # macOS path: exact tty -> Terminal.app tab -> re-check tty -> key.
         tab = await find_terminal_tab(tty)
         if tab is None:
-            # Another application hosts this tty. Press nothing.
             return NOT_FOUND
-        code, stdout, stderr = await _osascript(_send_script(tab, normalized),
-                                                SEND_TIMEOUT)
+
+        code, stdout, stderr = await _osascript(
+            _send_script(tab, normalized), SEND_TIMEOUT)
+
         if code != 0:
             if _is_permission_error(stderr):
-                log.warning(f"keystroke refused by macOS: {stderr.strip()}")
+                log.warning(
+                    f"keystroke refused by macOS: {stderr.strip()}")
                 return NOT_PERMITTED
-            log.warning(f"keystroke script failed ({code}): {stderr.strip()}")
+            log.warning(
+                f"keystroke script failed ({code}): {stderr.strip()}")
             return FAILED
+
         result = stdout.strip()
         if result == "ok":
             return SENT
+
         if result in ("gone", "moved"):
-            # The tab closed or the tty moved between the lookup and the
-            # press. Nothing was pressed; say so as not_found, which is the
-            # same thing from the user's side.
-            log.warning(f"tab for {tty} was {result} at press time")
+            log.warning(
+                f"tab for {tty} was {result} at press time")
             return NOT_FOUND
-        log.warning(f"unexpected keystroke script result: {result!r}")
+
+        log.warning(
+            f"unexpected keystroke script result: {result!r}")
         return FAILED
+
     except Exception as e:
-        log.warning(f"answering a dialog for pid {pid} failed: {e}", exc_info=True)
+        log.warning(
+            f"answering a dialog for pid {pid} failed: {e}",
+            exc_info=True)
         return FAILED
