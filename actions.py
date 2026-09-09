@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 
 log = logging.getLogger("jarvis.actions")
 
@@ -80,8 +82,70 @@ def applescript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", " ")
 
 
+
 async def open_terminal(command: str = "") -> dict:
-    """Open Terminal.app and optionally run a command. Marks it blue for JARVIS."""
+    """Open the native terminal and optionally run a command."""
+
+    if sys.platform.startswith("linux"):
+        terminal = (
+            shutil.which("gnome-terminal")
+            or shutil.which("x-terminal-emulator")
+        )
+
+        if not terminal:
+            return {
+                "success": False,
+                "confirmation": "I couldn't find a terminal emulator, sir.",
+            }
+
+        if command:
+            shell = shutil.which("bash") or "/bin/sh"
+
+            if os.path.basename(terminal) == "gnome-terminal":
+                argv = [terminal, "--", shell, "-lc", command]
+            else:
+                argv = [terminal, "-e", shell, "-lc", command]
+        else:
+            argv = [terminal]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        except OSError as e:
+            log.error(f"open_terminal could not launch: {e}")
+            return {
+                "success": False,
+                "confirmation": "I had trouble opening Terminal, sir.",
+            }
+
+        success = proc.returncode == 0
+
+        if not success:
+            log.error(
+                "open_terminal failed: "
+                + stderr.decode(errors="replace")
+            )
+
+        return {
+            "success": success,
+            "confirmation": (
+                "Terminal is open, sir."
+                if success
+                else "I had trouble opening Terminal, sir."
+            ),
+        }
+
+    if sys.platform != "darwin":
+        return {
+            "success": False,
+            "confirmation": "Terminal control isn't supported on this platform yet, sir.",
+        }
+
+    # Existing macOS implementation.
     if command:
         escaped = applescript_escape(command)
         script = (
@@ -96,38 +160,103 @@ async def open_terminal(command: str = "") -> dict:
             "    activate\n"
             "end tell"
         )
+
     proc = await asyncio.create_subprocess_exec(
         "osascript", "-e", script,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     _, stderr = await proc.communicate()
+
     success = proc.returncode == 0
+
     if not success:
         log.error(f"open_terminal failed: {stderr.decode()}")
     else:
         await _mark_terminal_as_jarvis()
+
     return {
         "success": success,
-        "confirmation": "Terminal is open, sir." if success else "I had trouble opening Terminal, sir.",
+        "confirmation": (
+            "Terminal is open, sir."
+            if success
+            else "I had trouble opening Terminal, sir."
+        ),
     }
 
 
 async def open_browser(url: str, browser: str = "chrome") -> dict:
-    """Open URL in user's browser (Chrome or Firefox).
+    """Open URL in Chrome, Firefox, or the system browser."""
 
-    The URL goes through `applescript_escape` and nothing else. A hand-rolled
-    `.replace('"', ...)` lived here and escaped the quote but not the
-    BACKSLASH, which is the half that matters: AppleScript reads `\\\\` as one
-    literal backslash, so a URL ending `x\\"` closes the string literal and
-    everything after it is code — and `do shell script` is in that language.
-    The URL arrives from a model, out of speech, possibly echoing a page or a
-    README, so this is a straight line from attacker text to a shell.
-    `tests/test_applescript_url_injection.py` runs the payload.
-    """
+    requested = browser.lower()
+
+    if sys.platform.startswith("linux"):
+        if requested == "firefox":
+            binary = shutil.which("firefox")
+            app_name = "Firefox"
+        else:
+            binary = (
+                shutil.which("google-chrome")
+                or shutil.which("chromium")
+                or shutil.which("chromium-browser")
+            )
+            app_name = "Chrome"
+
+        if binary:
+            argv = [binary, url]
+        else:
+            opener = shutil.which("xdg-open")
+
+            if not opener:
+                return {
+                    "success": False,
+                    "confirmation": f"{app_name} ran into a problem, sir.",
+                }
+
+            argv = [opener, url]
+            app_name = "your browser"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        except OSError as e:
+            log.error(f"open_browser could not launch: {e}")
+            return {
+                "success": False,
+                "confirmation": f"{app_name} ran into a problem, sir.",
+            }
+
+        success = proc.returncode == 0
+
+        if not success:
+            log.error(
+                f"open_browser ({app_name}) failed: "
+                + stderr.decode(errors="replace")
+            )
+
+        return {
+            "success": success,
+            "confirmation": (
+                f"Pulled that up in {app_name}, sir."
+                if success
+                else f"{app_name} ran into a problem, sir."
+            ),
+        }
+
+    if sys.platform != "darwin":
+        return {
+            "success": False,
+            "confirmation": "Browser control isn't supported on this platform yet, sir.",
+        }
+
+    # Existing macOS implementation.
     escaped_url = applescript_escape(url)
 
-    if browser.lower() == "firefox":
+    if requested == "firefox":
         app_name = "Firefox"
         script = (
             'tell application "Firefox"\n'
@@ -150,14 +279,20 @@ async def open_browser(url: str, browser: str = "chrome") -> dict:
         stderr=asyncio.subprocess.PIPE,
     )
     _, stderr = await proc.communicate()
+
     success = proc.returncode == 0
+
     if not success:
         log.error(f"open_browser ({app_name}) failed: {stderr.decode()}")
+
     return {
         "success": success,
-        "confirmation": f"Pulled that up in {app_name}, sir." if success else f"{app_name} ran into a problem, sir.",
+        "confirmation": (
+            f"Pulled that up in {app_name}, sir."
+            if success
+            else f"{app_name} ran into a problem, sir."
+        ),
     }
-
 
 # Keep backward compat
 async def open_chrome(url: str) -> dict:
@@ -216,12 +351,55 @@ def _vscode_command(path: str) -> list[str] | None:
     return None
 
 
+
 async def open_in_editor(path: str) -> dict:
     """Open a file or directory in VS Code, else in the system default."""
     argv = _vscode_command(path)
     editor = "VS Code"
+
     if argv is None:
-        argv = ["open", str(path)]
+        if sys.platform == "darwin":
+            argv = ["open", str(path)]
+        elif sys.platform.startswith("linux"):
+            opener = shutil.which("xdg-open")
+            if not opener:
+                return {
+                    "success": False,
+                    "editor": "your editor",
+                    "confirmation": "I couldn't open an editor, sir.",
+                }
+
+            # Desktop launchers may remain attached to the GUI application.
+            # Hand the path off and return immediately instead of awaiting the
+            # lifetime of the user's editor.
+            try:
+                subprocess.Popen(
+                    [opener, str(path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                log.error(f"open_in_editor could not launch: {e}")
+                return {
+                    "success": False,
+                    "editor": "your editor",
+                    "confirmation": "I couldn't open an editor, sir.",
+                }
+
+            return {
+                "success": True,
+                "editor": "your editor",
+                "confirmation": "Opened that in your editor, sir.",
+            }
+        else:
+            return {
+                "success": False,
+                "editor": "your editor",
+                "confirmation": "I couldn't open an editor, sir.",
+            }
+
         editor = "your editor"
 
     try:
@@ -234,18 +412,27 @@ async def open_in_editor(path: str) -> dict:
         success = proc.returncode == 0
     except OSError as e:
         log.error(f"open_in_editor could not launch: {e}")
-        return {"success": False, "editor": editor,
-                "confirmation": "I couldn't open an editor, sir."}
+        return {
+            "success": False,
+            "editor": editor,
+            "confirmation": "I couldn't open an editor, sir.",
+        }
 
     if not success:
-        log.error(f"open_in_editor failed: {stderr.decode(errors='replace')}")
+        log.error(
+            f"open_in_editor failed: "
+            f"{stderr.decode(errors='replace')}"
+        )
+
     return {
         "success": success,
         "editor": editor,
-        "confirmation": f"Opened that in {editor}, sir." if success
-        else f"{editor} wouldn't open that, sir.",
+        "confirmation": (
+            f"Opened that in {editor}, sir."
+            if success
+            else f"{editor} wouldn't open that, sir."
+        ),
     }
-
 
 def _generate_project_name(prompt: str) -> str:
     """Generate a kebab-case project folder name from the prompt."""
