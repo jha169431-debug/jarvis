@@ -366,6 +366,7 @@ async def test_the_capture_is_deleted_even_when_the_capture_fails(runner,
 @pytest.mark.asyncio
 async def test_the_window_list_names_the_app_the_title_and_which_is_front(
         monkeypatch):
+    monkeypatch.setattr(real_screen.sys, "platform", "darwin")
     async def _run(*args, timeout):
         assert args[0] == "osascript"
         return 0, ("Ghostty|||jarvis — main|||true\n"
@@ -380,6 +381,7 @@ async def test_the_window_list_names_the_app_the_title_and_which_is_front(
 
 @pytest.mark.asyncio
 async def test_the_window_list_is_bounded(monkeypatch):
+    monkeypatch.setattr(real_screen.sys, "platform", "darwin")
     async def _run(*args, timeout):
         return 0, "".join(f"App{i}|||Window {i}|||false\n" for i in range(200)), ""
 
@@ -427,6 +429,7 @@ async def test_the_real_script_never_answers_an_empty_desk_silently():
 @pytest.mark.asyncio
 async def test_no_accessibility_is_said_plainly_not_reported_as_an_empty_desk(
         monkeypatch, code):
+    monkeypatch.setattr(real_screen.sys, "platform", "darwin")
     """An empty list would have JARVIS say "nothing is open", which is a lie
     with a remedy attached. All three codes are ones this machine has actually
     produced for these System Events calls."""
@@ -442,6 +445,7 @@ async def test_no_accessibility_is_said_plainly_not_reported_as_an_empty_desk(
 
 @pytest.mark.asyncio
 async def test_the_window_list_is_time_boxed(monkeypatch):
+    monkeypatch.setattr(real_screen.sys, "platform", "darwin")
     """`osascript` against System Events can sit there for a long time if an
     app is not answering."""
     seen = {}

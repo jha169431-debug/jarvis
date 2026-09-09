@@ -47,6 +47,7 @@ import ctypes.util
 import logging
 import shutil
 import struct
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -380,12 +381,80 @@ _ACCESSIBILITY_MARKERS = ("-1728", "-1719", "-25211",
                           "not allowed assistive access")
 
 
-async def list_windows() -> list[Window]:
-    """Open windows: app name, window title, and which app is in front.
 
-    Raises ScreenError when Accessibility is missing. An empty list would have
-    JARVIS say "nothing is open" — a lie with a remedy attached.
-    """
+async def _list_windows_linux() -> list[Window]:
+    """Enumerate visible X11 windows and identify the active one."""
+
+    if not shutil.which("wmctrl") or not shutil.which("xprop"):
+        raise ScreenError(
+            "I can't read your windows because wmctrl or xprop is missing, sir"
+        )
+
+    rc, active_out, active_err = await _run(
+        "xprop", "-root", "_NET_ACTIVE_WINDOW",
+        timeout=WINDOWS_TIMEOUT_SEC,
+    )
+    if rc != 0:
+        log.warning(
+            f"xprop active-window lookup failed: {active_err.strip()[:200]}"
+        )
+        raise ScreenError("I couldn't tell which window is in front, sir")
+
+    match = re.search(r"0x[0-9a-fA-F]+", active_out)
+    active_id = int(match.group(0), 16) if match else None
+
+    rc, stdout, stderr = await _run(
+        "wmctrl", "-lx",
+        timeout=WINDOWS_TIMEOUT_SEC,
+    )
+    if rc != 0:
+        log.warning(f"wmctrl window listing failed: {stderr.strip()[:200]}")
+        raise ScreenError("I couldn't read what's open, sir")
+
+    windows: list[Window] = []
+
+    for line in stdout.splitlines():
+        # wmctrl -lx:
+        # ID DESKTOP HOST WM_CLASS TITLE...
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+
+        wid_text, _desktop, wm_class, _host, title = parts
+
+        try:
+            wid = int(wid_text, 16)
+        except ValueError:
+            continue
+
+        title = title.strip()
+        if not title:
+            continue
+
+        # Typical X11 class:
+        # gnome-terminal-server.Gnome-terminal
+        app = wm_class.split(".", 1)[-1].strip() or wm_class.strip()
+
+        windows.append(
+            Window(
+                app=app,
+                title=title,
+                frontmost=(active_id is not None and wid == active_id),
+            )
+        )
+
+        if len(windows) >= MAX_WINDOWS:
+            break
+
+    return windows
+
+
+async def list_windows() -> list[Window]:
+    """Open windows: app name, window title, and which app is in front."""
+
+    if sys.platform.startswith("linux"):
+        return await _list_windows_linux()
+
     rc, stdout, stderr = await _run("osascript", "-e", _WINDOWS_SCRIPT,
                                     timeout=WINDOWS_TIMEOUT_SEC)
     if rc != 0:
