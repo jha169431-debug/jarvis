@@ -119,6 +119,9 @@ def _bmp(pixels: bytes, bpp: int = 24) -> bytes:
 
 @pytest.fixture
 def runner(monkeypatch):
+    # This fixture models the original macOS screencapture/sips backend.
+    # Linux capture behavior has its own dedicated test module.
+    monkeypatch.setattr(real_screen.sys, "platform", "darwin")
     fake = _Runner()
     monkeypatch.setattr(real_screen, "_run", fake)
     monkeypatch.setattr(real_screen, "screen_recording_granted", lambda: True)

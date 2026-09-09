@@ -247,25 +247,39 @@ def _is_blank(pixels: list[tuple[int, int, int]]) -> bool:
 
 
 async def _frame_is_blank(path: Path, workdir: Path) -> bool:
-    """Whether the capture came back all one colour.
+    """Return whether a captured frame is effectively blank."""
 
-    Without Screen Recording, `screencapture` does not fail loudly — it exits
-    0 and can hand back a black frame. A tool that returns a black rectangle
-    and lets JARVIS confidently describe nothing is the worst failure this
-    project has: a confident answer about an empty picture.
-
-    `sips` does the decoding (a 32px BMP), so no image library is needed and
-    no PNG variant has to be parsed here. If sips itself will not run, this
-    says False: refusing a good capture over a tooling failure is worse than
-    leaning on the permission probe, which has already been asked.
-    """
     sample = workdir / "sample.bmp"
-    rc, _out, err = await _run(
-        "sips", "-Z", str(BLANK_SAMPLE_EDGE), "-s", "format", "bmp",
-        "--out", str(sample), str(path), timeout=RESIZE_TIMEOUT_SEC)
+
+    if sys.platform.startswith("linux"):
+        if not shutil.which("ffmpeg"):
+            log.warning("blank-frame check skipped: ffmpeg is unavailable")
+            return False
+
+        rc, _out, err = await _run(
+            "ffmpeg",
+            "-loglevel", "error",
+            "-y",
+            "-i", str(path),
+            "-vf", f"scale={BLANK_SAMPLE_EDGE}:{BLANK_SAMPLE_EDGE}",
+            "-frames:v", "1",
+            str(sample),
+            timeout=RESIZE_TIMEOUT_SEC,
+        )
+
+    else:
+        rc, _out, err = await _run(
+            "sips", "-Z", str(BLANK_SAMPLE_EDGE),
+            "-s", "format", "bmp",
+            "--out", str(sample),
+            str(path),
+            timeout=RESIZE_TIMEOUT_SEC,
+        )
+
     if rc != 0 or not sample.exists():
         log.warning(f"blank-frame check could not run: {err.strip()[:120]}")
         return False
+
     try:
         return _is_blank(_bmp_pixels(sample.read_bytes()))
     except OSError:
@@ -293,14 +307,40 @@ async def capture_screen(display: int | None = None) -> Shot:
     workdir = Path(tempfile.mkdtemp(prefix="jarvis-screen-"))
     try:
         shot_path = workdir / "screen.png"
-        # -x: no shutter sound. -m: the MAIN display only. -D N: that display.
-        # Never bare `screencapture`: with neither flag it writes one file PER
-        # display and the single path we read back would be a lottery.
-        where = ["-D", str(display)] if display else ["-m"]
-        rc, _out, err = await _run("screencapture", "-x", *where, str(shot_path),
-                                   timeout=CAPTURE_TIMEOUT_SEC)
+        if sys.platform.startswith("linux"):
+            if display is not None:
+                raise ScreenError(
+                    "I can't select an individual Linux display yet, sir"
+                )
+
+            if not shutil.which("gnome-screenshot"):
+                raise ScreenError(
+                    "I can't take a screenshot because gnome-screenshot is missing, sir"
+                )
+
+            rc, _out, err = await _run(
+                "gnome-screenshot",
+                "-f", str(shot_path),
+                timeout=CAPTURE_TIMEOUT_SEC,
+            )
+            backend = "gnome-screenshot"
+
+        elif sys.platform == "darwin":
+            # -x: silent. -m: main display. -D N: selected display.
+            where = ["-D", str(display)] if display else ["-m"]
+            rc, _out, err = await _run(
+                "screencapture", "-x", *where, str(shot_path),
+                timeout=CAPTURE_TIMEOUT_SEC,
+            )
+            backend = "screencapture"
+
+        else:
+            raise ScreenError(
+                "screen capture isn't supported on this platform yet, sir"
+            )
+
         if rc != 0 or not shot_path.exists():
-            log.warning(f"screencapture failed: {err.strip()[:200]}")
+            log.warning(f"{backend} failed: {err.strip()[:200]}")
             raise ScreenError("I couldn't get a picture of your screen, sir")
 
         png = shot_path.read_bytes()
@@ -310,9 +350,36 @@ async def capture_screen(display: int | None = None) -> Shot:
 
         if max(size) > SHOT_MAX_EDGE:
             small_path = workdir / "small.png"
-            rc, _out, err = await _run(
-                "sips", "-Z", str(SHOT_MAX_EDGE), "--out", str(small_path),
-                str(shot_path), timeout=RESIZE_TIMEOUT_SEC)
+            if sys.platform.startswith("linux"):
+                if not shutil.which("ffmpeg"):
+                    raise ScreenError(
+                        "I couldn't resize your screen because ffmpeg is missing, sir"
+                    )
+
+                # Preserve aspect ratio while bounding the longest edge.
+                scale = (
+                    f"scale={SHOT_MAX_EDGE}:-2"
+                    if size[0] >= size[1]
+                    else f"scale=-2:{SHOT_MAX_EDGE}"
+                )
+
+                rc, _out, err = await _run(
+                    "ffmpeg",
+                    "-loglevel", "error",
+                    "-y",
+                    "-i", str(shot_path),
+                    "-vf", scale,
+                    "-frames:v", "1",
+                    str(small_path),
+                    timeout=RESIZE_TIMEOUT_SEC,
+                )
+            else:
+                rc, _out, err = await _run(
+                    "sips", "-Z", str(SHOT_MAX_EDGE),
+                    "--out", str(small_path),
+                    str(shot_path),
+                    timeout=RESIZE_TIMEOUT_SEC,
+                )
             small = small_path.read_bytes() if small_path.exists() else b""
             small_size = _png_size(small) if small else None
             if rc != 0 or small_size is None:
