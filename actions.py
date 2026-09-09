@@ -1,5 +1,5 @@
 """
-JARVIS Action Executor — AppleScript-based system actions.
+JARVIS Action Executor — platform-aware system actions.
 
 Execute actions IMMEDIATELY, before generating any LLM response.
 Each function returns {"success": bool, "confirmation": str}.
@@ -300,7 +300,16 @@ async def open_chrome(url: str) -> dict:
 
 
 async def get_chrome_tab_info() -> dict:
-    """Read the current Chrome tab's title and URL via AppleScript."""
+    """Read the current Chrome tab's title and URL when safely supported.
+
+    macOS uses Chrome's AppleScript interface. Linux deliberately returns an
+    empty result: an ordinary Chrome/Chromium process exposes no equivalent
+    safe current-tab API unless it was explicitly launched with a debugging
+    interface, which JARVIS must not assume or enable behind the user's back.
+    """
+    if sys.platform != "darwin":
+        return {}
+
     script = (
         'tell application "Google Chrome"\n'
         "    set tabTitle to title of active tab of front window\n"

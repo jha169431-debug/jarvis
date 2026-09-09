@@ -109,3 +109,17 @@ async def test_linux_terminal_missing_backend_fails_cleanly(monkeypatch):
     result = await actions.open_terminal()
 
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_linux_chrome_tab_info_fails_closed_without_osascript(monkeypatch):
+    monkeypatch.setattr(actions.sys, "platform", "linux")
+
+    async def never_exec(*_args, **_kwargs):
+        raise AssertionError("Linux Chrome tab lookup must not invoke osascript")
+
+    monkeypatch.setattr(actions.asyncio, "create_subprocess_exec", never_exec)
+
+    result = await actions.get_chrome_tab_info()
+
+    assert result == {}
