@@ -101,6 +101,26 @@ FISH_API_URL = "https://api.fish.audio/v1/tts"
 USER_NAME = os.getenv("USER_NAME", "sir")
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
+# Speech recognition backend. Keep Web Speech as the portable/upstream
+# default; Linux installations may explicitly opt into the local backend.
+STT_MODE = os.getenv("JARVIS_STT_MODE", "web").strip().lower()
+if STT_MODE not in {"web", "local"}:
+    STT_MODE = "web"
+
+MAX_STT_AUDIO_BYTES = 4 * 1024 * 1024
+STT_AUDIO_MIME_TYPES = frozenset({
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/webm",
+    "audio/webm;codecs=opus",
+    "audio/ogg",
+    "audio/ogg;codecs=opus",
+})
+
+_local_stt_instance = None
+_local_stt_init_lock = threading.Lock()
+
 DESKTOP_PATH = Path.home() / "Desktop"
 
 
@@ -6565,6 +6585,139 @@ def _scan_projects_sync() -> list[dict]:
     return projects
 
 
+async def _handle_final_voice_text(text: str) -> None:
+    """Feed one final transcript through the existing voice trust path."""
+    if speech is None:
+        return
+
+    text = apply_speech_corrections(text.strip())
+    if not text:
+        return
+
+    verdict = await speech.user_final(text)
+
+    if verdict == "replay":
+        # "Say that again": resend what was already synthesized — no brain
+        # turn, so no cost and no risk of coming back with different words.
+        log.info("User (replay): %s", text)
+        if not await speech.replay_last():
+            await speech.say(NOTHING_TO_REPLAY_LINE, Priority.NORMAL)
+        return
+
+    if verdict != "speech":
+        # Preserve the existing diagnostic: the age of the last played chunk
+        # is what distinguishes echo/cancel handling from real user speech.
+        since = speech.seconds_since_last_played()
+        ago = (
+            f"{since:.1f}s after his last audio"
+            if since != float("inf")
+            else "with nothing of his played yet"
+        )
+        log.info("User (%s, ignored, %s): %s", verdict, ago, text)
+        return
+
+    log.info("User: %s", text)
+    if _is_fresh_start(text):
+        _spawn(_start_fresh())
+        return
+
+    _spawn(_handle_utterance(text))
+
+
+def _decode_stt_audio(msg: dict) -> tuple[bytes, str]:
+    """Validate and decode one localhost STT audio message."""
+    mime = str(msg.get("mime", "")).strip().lower()
+    if mime not in STT_AUDIO_MIME_TYPES:
+        raise ValueError("unsupported audio type")
+
+    encoded = msg.get("data")
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("missing audio data")
+
+    # Bound the encoded representation before allocating decoded bytes.
+    max_b64 = ((MAX_STT_AUDIO_BYTES + 2) // 3) * 4
+    if len(encoded) > max_b64:
+        raise ValueError("audio too large")
+
+    try:
+        audio = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("invalid base64 audio") from exc
+
+    if not audio or len(audio) > MAX_STT_AUDIO_BYTES:
+        raise ValueError("invalid audio size")
+
+    return audio, mime
+
+
+def _transcribe_local_audio(audio: bytes) -> str:
+    """Run the process-global local recognizer from a worker thread."""
+    global _local_stt_instance
+
+    if _local_stt_instance is None:
+        with _local_stt_init_lock:
+            if _local_stt_instance is None:
+                from local_stt import LocalSTT
+
+                _local_stt_instance = LocalSTT(
+                    model_name=os.getenv("JARVIS_STT_MODEL", "small.en"),
+                    device=os.getenv("JARVIS_STT_DEVICE", "cuda"),
+                    compute_type=os.getenv(
+                        "JARVIS_STT_COMPUTE_TYPE",
+                        "float16",
+                    ),
+                )
+
+    return _local_stt_instance.transcribe(audio)
+
+
+async def _voice_stt_worker(
+    inbox: asyncio.Queue,
+    outbound: asyncio.Queue,
+) -> None:
+    """Transcribe queued utterances without blocking the WebSocket receiver."""
+    while True:
+        item = await inbox.get()
+        try:
+            if item is None:
+                return
+
+            audio, mime = item
+
+            try:
+                text = await asyncio.to_thread(
+                    _transcribe_local_audio,
+                    audio,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("local STT failed (%s, %d bytes)", mime, len(audio))
+                _enqueue(outbound, {
+                    "type": "stt_error",
+                    "text": "Local speech recognition failed.",
+                })
+                continue
+
+            text = text.strip()
+
+            # Let the browser know that recognition completed. This is also
+            # useful to keep its microphone-health UI separate from STT health.
+            _enqueue(outbound, {
+                "type": "stt_result",
+                "text": text,
+            })
+
+            if not text:
+                log.info("local STT: no speech")
+                continue
+
+            log.info("stt-hears: %s", text[-120:])
+            await _handle_final_voice_text(text)
+        finally:
+            inbox.task_done()
+
+
 # -- WebSocket Voice Handler -----------------------------------------------
 
 @app.websocket("/ws/voice")
@@ -6589,12 +6742,25 @@ async def voice_handler(ws: WebSocket):
     """
     await ws.accept()
     queue = _add_voice_client(ws)
+
+    stt_inbox = None
+    stt_task = None
+    if STT_MODE == "local":
+        stt_inbox = asyncio.Queue(maxsize=2)
+        stt_task = asyncio.create_task(
+            _voice_stt_worker(stt_inbox, queue)
+        )
+
     log.info("Voice WebSocket connected")
     try:
         # Through this client's own queue, not straight down the socket, so
         # the opening frames cannot be overtaken by a broadcast that lands
         # while they are in flight.
-        _enqueue(queue, {"type": "config", "muteMicDuringSpeech": MUTE_MIC_DURING_SPEECH})
+        _enqueue(queue, {
+            "type": "config",
+            "muteMicDuringSpeech": MUTE_MIC_DURING_SPEECH,
+            "sttMode": STT_MODE,
+        })
         _enqueue(queue, {"type": "status", "state": "idle"})
 
         global _last_greeting_time
@@ -6633,6 +6799,34 @@ async def voice_handler(ws: WebSocket):
                 log.info("hush: stopped by the user")
                 await speech.barge_in(keep_unread=False, reason="hush (key)")
                 continue
+            if kind == "stt_audio":
+                if STT_MODE != "local" or stt_inbox is None:
+                    _enqueue(queue, {
+                        "type": "stt_error",
+                        "text": "Local speech recognition is not enabled.",
+                    })
+                    continue
+
+                try:
+                    audio, mime = _decode_stt_audio(msg)
+                except ValueError as exc:
+                    log.warning("rejected STT audio: %s", exc)
+                    _enqueue(queue, {
+                        "type": "stt_error",
+                        "text": "Invalid speech audio.",
+                    })
+                    continue
+
+                try:
+                    stt_inbox.put_nowait((audio, mime))
+                except asyncio.QueueFull:
+                    log.warning("local STT queue full; dropping utterance")
+                    _enqueue(queue, {
+                        "type": "stt_error",
+                        "text": "Speech recognition is busy; please repeat.",
+                    })
+                continue
+
             if kind == "interim":
                 # Logged because its ABSENCE is the diagnosis. A session that
                 # is capturing but returning nothing looks identical, from
@@ -6652,39 +6846,20 @@ async def voice_handler(ws: WebSocket):
                 except (KeyError, TypeError, ValueError, OverflowError):
                     pass
             elif kind == "transcript" and msg.get("isFinal"):
-                text = apply_speech_corrections(str(msg.get("text", "")).strip())
-                if not text:
-                    continue
-                verdict = await speech.user_final(text)
-                if verdict == "replay":
-                    # "Say that again": resend what was already synthesized —
-                    # no brain turn, so no cost and no risk of coming back
-                    # with different words. Never routed to _handle_utterance.
-                    log.info(f"User (replay): {text}")
-                    if not await speech.replay_last():
-                        await speech.say(NOTHING_TO_REPLAY_LINE, Priority.NORMAL)
-                    continue
-                if verdict != "speech":
-                    # Say WHY, so a dropped sentence can be diagnosed from the
-                    # log alone. Live, "User (echo, ignored): now" was the first
-                    # word of the user's reply being eaten, and it took a
-                    # transcript read-through to see that -- the age of the
-                    # last played chunk is the fact that decides it.
-                    since = speech.seconds_since_last_played()
-                    ago = f"{since:.1f}s after his last audio" if since != float("inf") \
-                        else "with nothing of his played yet"
-                    log.info(f"User ({verdict}, ignored, {ago}): {text}")
-                    continue
-                log.info(f"User: {text}")
-                if _is_fresh_start(text):
-                    _spawn(_start_fresh())
-                    continue
-                _spawn(_handle_utterance(text))
+                await _handle_final_voice_text(
+                    str(msg.get("text", ""))
+                )
     except WebSocketDisconnect:
         log.info("Voice WebSocket disconnected")
     except Exception as e:
         log.error(f"WebSocket error: {e}", exc_info=True)
     finally:
+        if stt_task is not None:
+            stt_task.cancel()
+            try:
+                await stt_task
+            except asyncio.CancelledError:
+                pass
         _drop_voice_client(ws)
 
 

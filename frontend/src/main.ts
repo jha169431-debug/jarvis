@@ -6,7 +6,7 @@
  */
 
 import { createOrb, type OrbState } from "./orb";
-import { createVoiceInput, createAudioPlayer, createMicMonitor } from "./voice";
+import { createVoiceInput, createLocalVoiceInput, createAudioPlayer, createMicMonitor, type VoiceInput } from "./voice";
 import { createSocket } from "./ws";
 import { openSettings, checkFirstTimeSetup } from "./settings";
 import "./style.css";
@@ -56,6 +56,8 @@ const audioPlayer = createAudioPlayer();
 orb.setAnalyser(audioPlayer.getAnalyser());
 
 let muteMicDuringSpeech = false;
+let sttMode: "web" | "local" = "web";
+let voiceStarted = false;
 
 function transition(newState: State) {
   if (newState === currentState) return;
@@ -77,26 +79,85 @@ function transition(newState: State) {
 // Voice input
 // ---------------------------------------------------------------------------
 
-const voiceInput = createVoiceInput(
-  (text: string) => {
-    // The server decides whether this is echo, a barge-in, or a new turn.
-    micMonitor.sawSpeech();
-    socket.send({ type: "transcript", text, isFinal: true });
-  },
-  (text: string) => {
-    micMonitor.sawSpeech();
-    socket.send({ type: "interim", text });
-  },
-  (msg: string) => {
-    showError(msg);
-  },
-  (event: string) => {
-    // Mirror the recogniser's lifecycle to the server log. Going deaf is a
-    // browser-side failure the server cannot otherwise see at all, and the
-    // console it used to be confined to is never open when it happens.
-    socket.send({ type: "mic", text: event });
+const noopVoiceInput: VoiceInput = {
+  start() {},
+  stop() {},
+  pause() {},
+  resume() {},
+  restart() {},
+};
+
+let voiceInput: VoiceInput = noopVoiceInput;
+let voiceInputInstalled = false;
+
+type MicMonitor = ReturnType<typeof createMicMonitor>;
+
+const noopMicMonitor: MicMonitor = {
+  sawSpeech() {},
+  stop() {},
+};
+
+let micMonitor: MicMonitor = noopMicMonitor;
+
+const onFinalTranscript = (text: string) => {
+  micMonitor.sawSpeech();
+  socket.send({ type: "transcript", text, isFinal: true });
+};
+
+const onInterimTranscript = (text: string) => {
+  micMonitor.sawSpeech();
+  socket.send({ type: "interim", text });
+};
+
+const onVoiceError = (msg: string) => {
+  showError(msg);
+};
+
+const onVoiceEvent = (event: string) => {
+  socket.send({ type: "mic", text: event });
+};
+
+function installVoiceInput(mode: "web" | "local") {
+  voiceInput.stop();
+  micMonitor.stop();
+  micMonitor = noopMicMonitor;
+  sttMode = mode;
+
+  if (mode === "local") {
+    voiceInput = createLocalVoiceInput(
+      (data: string, mime: string) => {
+        socket.send({ type: "stt_audio", mime, data });
+      },
+      onVoiceError,
+      onVoiceEvent,
+      updateMicLevel,
+    );
+  } else {
+    voiceInput = createVoiceInput(
+      onFinalTranscript,
+      onInterimTranscript,
+      onVoiceError,
+      onVoiceEvent,
+    );
+
+    micMonitor = createMicMonitor(
+      updateMicLevel,
+      (event: string) => {
+        socket.send({ type: "mic", text: event });
+
+        if (event.startsWith("DEAF")) {
+          voiceInput.restart("deaf: audio in, no results");
+        }
+      },
+    );
   }
-);
+
+  voiceInputInstalled = true;
+
+  if (voiceStarted && !isMuted) {
+    voiceInput.start();
+  }
+}
 
 // A live meter for the microphone itself. If this moves when you speak, the
 // microphone is working — whatever else is or is not happening. It answers
@@ -106,20 +167,11 @@ micDot.id = "mic-level";
 micDot.title = "microphone input";
 document.body.appendChild(micDot);
 
-const micMonitor = createMicMonitor(
-  (level: number) => {
-    const pct = Math.min(100, Math.round(level * 900));
-    micDot.style.setProperty("--level", `${pct}%`);
-    micDot.classList.toggle("is-hot", level > 0.02);
-  },
-  (event: string) => {
-    socket.send({ type: "mic", text: event });
-    // Proven deaf: sound going in, nothing coming out. Do not wait for the
-    // rotation timer to happen along — measured once at 21 seconds, all of
-    // it lost. Rebuild the recogniser now.
-    if (event.startsWith("DEAF")) voiceInput.restart("deaf: audio in, no results");
-  }
-);
+function updateMicLevel(level: number) {
+  const pct = Math.min(100, Math.round(level * 900));
+  micDot.style.setProperty("--level", `${pct}%`);
+  micDot.classList.toggle("is-hot", level > 0.02);
+}
 
 // ── stopping him ──────────────────────────────────────────────────────────
 // Escape, or the button that appears while he is talking. Not a spoken word:
@@ -168,6 +220,16 @@ socket.onMessage((msg) => {
 
   if (type === "config") {
     muteMicDuringSpeech = Boolean(msg.muteMicDuringSpeech);
+    const mode: "web" | "local" =
+      msg.sttMode === "local" ? "local" : "web";
+    if (!voiceInputInstalled || mode !== sttMode) {
+      installVoiceInput(mode);
+    }
+  } else if (type === "stt_result") {
+    micMonitor.sawSpeech();
+    if (msg.text) console.log("[STT]", msg.text);
+  } else if (type === "stt_error") {
+    showError(String(msg.text ?? "Speech recognition failed."));
   } else if (type === "audio") {
     const data = msg.data as string;
     if (data) {
@@ -206,6 +268,7 @@ socket.onMessage((msg) => {
 
 // Start listening after a brief delay for the orb to render
 setTimeout(() => {
+  voiceStarted = true;
   voiceInput.start();
   if (currentState !== "speaking") transition("listening");
 }, 1000);

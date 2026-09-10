@@ -36,6 +36,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
     monkeypatch.setenv("FISH_API_KEY", "fish-test")
+    monkeypatch.setenv("JARVIS_STT_MODE", "web")
     import data_paths
     importlib.reload(data_paths)
     import run_store
@@ -70,7 +71,11 @@ def _drain_until(ws, predicate, limit=10):
 def test_connect_sends_config_and_idle(client):
     c, server = client
     with c.websocket_connect("/ws/voice") as ws:
-        assert ws.receive_json() == {"type": "config", "muteMicDuringSpeech": False}
+        assert ws.receive_json() == {
+            "type": "config",
+            "muteMicDuringSpeech": False,
+            "sttMode": "web",
+        }
         assert ws.receive_json() == {"type": "status", "state": "idle"}
 
 
@@ -280,3 +285,76 @@ def test_fmt_reset_names_the_day_when_it_is_not_today(client):
     assert far.endswith(" at 10 AM") and any(ch.isdigit() for ch in far.split(" at ")[0])
     assert server._fmt_reset(None) == "later"
     assert server._fmt_reset("not a time") == "later"
+
+
+def test_local_stt_audio_uses_existing_final_transcript_path(client, monkeypatch):
+    import base64
+
+    c, server = client
+    server.STT_MODE = "local"
+
+    received = []
+
+    def fake_transcribe(audio):
+        received.append(audio)
+        return "hello from local speech"
+
+    monkeypatch.setattr(
+        server,
+        "_transcribe_local_audio",
+        fake_transcribe,
+    )
+
+    with c.websocket_connect("/ws/voice") as ws:
+        config = ws.receive_json()
+        assert config["type"] == "config"
+        assert config["sttMode"] == "local"
+        assert ws.receive_json() == {"type": "status", "state": "idle"}
+
+        payload = b"RIFF-local-stt-test"
+        ws.send_json({
+            "type": "stt_audio",
+            "mime": "audio/wav",
+            "data": base64.b64encode(payload).decode("ascii"),
+        })
+
+        seen = _drain_until(
+            ws,
+            lambda m: m.get("type") == "audio",
+        )
+
+        assert any(
+            m == {
+                "type": "stt_result",
+                "text": "hello from local speech",
+            }
+            for m in seen
+        )
+
+        assert received == [payload]
+        assert server.brain_instance.turns == [
+            ("hello from local speech", "user")
+        ]
+
+
+def test_stt_audio_is_rejected_when_local_mode_is_off(client):
+    import base64
+
+    c, server = client
+    assert server.STT_MODE == "web"
+
+    with c.websocket_connect("/ws/voice") as ws:
+        ws.receive_json()
+        ws.receive_json()
+
+        ws.send_json({
+            "type": "stt_audio",
+            "mime": "audio/wav",
+            "data": base64.b64encode(b"RIFF-test").decode("ascii"),
+        })
+
+        msg = ws.receive_json()
+        assert msg == {
+            "type": "stt_error",
+            "text": "Local speech recognition is not enabled.",
+        }

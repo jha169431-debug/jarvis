@@ -96,49 +96,94 @@ declare const webkitSpeechRecognition: any;
 export function createMicMonitor(
   onLevel: (level: number) => void,
   onEvent: (event: string) => void
-): { sawSpeech(): void } {
+): { sawSpeech(): void; stop(): void } {
   let lastLoudAt = 0;
   let lastResultAt = Date.now();
   let complainedAt = 0;
+  let active = true;
+  let stream: MediaStream | null = null;
+  let ctx: AudioContext | null = null;
+  let timer: ReturnType<typeof setInterval> | null = null;
 
-  navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-    const ctx = new AudioContext();
-    const source = ctx.createMediaStreamSource(stream);
+  navigator.mediaDevices.getUserMedia({ audio: true }).then((openedStream) => {
+    if (!active) {
+      openedStream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+
+    stream = openedStream;
+    ctx = new AudioContext();
+
+    const source = ctx.createMediaStreamSource(openedStream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
     source.connect(analyser);
+
     const buf = new Uint8Array(analyser.fftSize);
     onEvent("mic monitor attached");
 
-    setInterval(() => {
+    timer = setInterval(() => {
+      if (!active) return;
+
       analyser.getByteTimeDomainData(buf);
+
       let sum = 0;
       for (let i = 0; i < buf.length; i++) {
         const v = (buf[i] - 128) / 128;
         sum += v * v;
       }
+
       const rms = Math.sqrt(sum / buf.length);
       onLevel(rms);
 
       const now = Date.now();
       if (rms > SPEECH_LEVEL) lastLoudAt = now;
 
-      // Sound went into the microphone and nothing came back out of the
-      // recogniser. This is the report that could not be made before.
-      if (lastLoudAt && now - lastLoudAt < 500 &&
-          now - lastResultAt > DEAF_AFTER_MS &&
-          now - complainedAt > 15000) {
+      if (
+        lastLoudAt &&
+        now - lastLoudAt < 500 &&
+        now - lastResultAt > DEAF_AFTER_MS &&
+        now - complainedAt > 15000
+      ) {
         complainedAt = now;
-        onEvent(`DEAF: mic is hearing sound (level ${rms.toFixed(3)}) but the ` +
-                `recogniser has returned nothing for ${Math.round((now - lastResultAt) / 1000)}s`);
+        onEvent(
+          `DEAF: mic is hearing sound (level ${rms.toFixed(3)}) but the ` +
+          `recogniser has returned nothing for ${Math.round(
+            (now - lastResultAt) / 1000
+          )}s`
+        );
       }
     }, 200);
   }).catch((e) => {
-    onEvent(`mic monitor could not open the microphone: ${e && e.name}`);
+    if (active) {
+      onEvent(`mic monitor could not open the microphone: ${e && e.name}`);
+    }
   });
 
   return {
-    sawSpeech() { lastResultAt = Date.now(); },
+    sawSpeech() {
+      lastResultAt = Date.now();
+    },
+
+    stop() {
+      if (!active) return;
+      active = false;
+
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+
+      stream?.getTracks().forEach((track) => track.stop());
+      stream = null;
+
+      if (ctx) {
+        void ctx.close().catch(() => {});
+        ctx = null;
+      }
+
+      onLevel(0);
+    },
   };
 }
 
@@ -469,6 +514,370 @@ export function createVoiceInput(
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Local STT input — browser capture, server-side recognition
+// ---------------------------------------------------------------------------
+
+// Local endpointing adapts to the room instead of assuming one fixed
+// microphone level. Speech must remain above the dynamic start threshold for
+// several consecutive samples before a recording begins.
+const LOCAL_NOISE_FLOOR_MIN = 0.004;
+const LOCAL_START_ABSOLUTE_MIN = 0.025;
+const LOCAL_KEEP_ABSOLUTE_MIN = 0.010;
+const LOCAL_START_MULTIPLIER = 3.0;
+const LOCAL_KEEP_MULTIPLIER = 1.6;
+const LOCAL_START_TICKS = 3;
+const LOCAL_CALIBRATION_MS = 1200;
+const LOCAL_SILENCE_MS = 900;
+const LOCAL_MIN_UTTERANCE_MS = 450;
+const LOCAL_MAX_UTTERANCE_MS = 15000;
+const LOCAL_VAD_POLL_MS = 40;
+
+interface LocalCapture {
+  recorder: MediaRecorder;
+  chunks: Blob[];
+  startedAt: number;
+  send: boolean;
+  mime: string;
+  strongTicks: number;
+}
+
+function preferredRecorderMime(): string {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/ogg;codecs=opus",
+    "audio/webm",
+    "audio/ogg",
+  ];
+  return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("audio read failed"));
+    reader.onload = () => {
+      const value = String(reader.result ?? "");
+      const comma = value.indexOf(",");
+      resolve(comma >= 0 ? value.slice(comma + 1) : "");
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+export function createLocalVoiceInput(
+  onAudio: (data: string, mime: string) => void,
+  onError: (msg: string) => void,
+  onMicEvent: (event: string) => void = () => {},
+  onLevel: (level: number) => void = () => {}
+): VoiceInput {
+  let shouldListen = false;
+  let paused = false;
+  let stream: MediaStream | null = null;
+  let audioCtx: AudioContext | null = null;
+  let analyser: AnalyserNode | null = null;
+  let meter: Uint8Array<ArrayBuffer> | null = null;
+  let vadTimer: ReturnType<typeof setInterval> | null = null;
+  let capture: LocalCapture | null = null;
+  let opening: Promise<void> | null = null;
+  let lastLoudAt = 0;
+  let openedAt = 0;
+  let noiseFloor = LOCAL_NOISE_FLOOR_MIN;
+  let startTicks = 0;
+
+  const mark = (what: string) => {
+    console.info(`[voice-local] ${new Date().toLocaleTimeString()} ${what}`);
+    onMicEvent(what);
+  };
+
+  function finishCapture(send: boolean) {
+    const current = capture;
+    if (!current) return;
+
+    current.send = send;
+    if (current.recorder.state !== "inactive") {
+      try {
+        current.recorder.stop();
+      } catch {
+        // Already stopping.
+      }
+    }
+  }
+
+  function beginCapture() {
+    if (!stream || capture || paused || !shouldListen) return;
+
+    const wantedMime = preferredRecorderMime();
+
+    let recorder: MediaRecorder;
+    try {
+      recorder = wantedMime
+        ? new MediaRecorder(stream, {
+            mimeType: wantedMime,
+            audioBitsPerSecond: 64000,
+          })
+        : new MediaRecorder(stream, {
+            audioBitsPerSecond: 64000,
+          });
+    } catch (e) {
+      onError(`Could not start local speech capture: ${String(e)}`);
+      return;
+    }
+
+    const current: LocalCapture = {
+      recorder,
+      chunks: [],
+      startedAt: Date.now(),
+      send: true,
+      mime: recorder.mimeType || wantedMime || "audio/webm",
+      strongTicks: 1,
+    };
+    capture = current;
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) current.chunks.push(event.data);
+    };
+
+    recorder.onerror = () => {
+      current.send = false;
+      onError("Local microphone recording failed.");
+    };
+
+    recorder.onstop = () => {
+      if (capture === current) capture = null;
+
+      const duration = Date.now() - current.startedAt;
+      if (
+        !current.send ||
+        duration < LOCAL_MIN_UTTERANCE_MS ||
+        current.strongTicks < 2
+      ) {
+        mark(`discarded weak capture: ${duration}ms, strong=${current.strongTicks}`);
+        return;
+      }
+
+      const blob = new Blob(current.chunks, { type: current.mime });
+      if (!blob.size) return;
+
+      void blobToBase64(blob)
+        .then((data) => {
+          if (!data) return;
+          mark(`utterance ready: ${blob.size} bytes`);
+          onAudio(data, current.mime);
+        })
+        .catch((e) => {
+          console.error("[voice-local] audio encoding failed", e);
+          onError("Could not encode microphone audio.");
+        });
+    };
+
+    try {
+      recorder.start();
+      mark("speech started");
+    } catch (e) {
+      capture = null;
+      onError(`Could not start microphone recording: ${String(e)}`);
+    }
+  }
+
+  function sampleMic() {
+    if (!shouldListen || paused || !analyser || !meter) return;
+
+    analyser.getByteTimeDomainData(meter);
+
+    let sum = 0;
+    for (let i = 0; i < meter.length; i++) {
+      const v = (meter[i] - 128) / 128;
+      sum += v * v;
+    }
+
+    const rms = Math.sqrt(sum / meter.length);
+    onLevel(rms);
+
+    const now = Date.now();
+
+    if (!capture) {
+      // During the first moment after opening, learn ordinary room tone and
+      // deliberately refuse to start an utterance.
+      if (now - openedAt < LOCAL_CALIBRATION_MS) {
+        noiseFloor = Math.max(
+          LOCAL_NOISE_FLOOR_MIN,
+          noiseFloor * 0.90 + rms * 0.10,
+        );
+        startTicks = 0;
+        return;
+      }
+
+      const startLevel = Math.max(
+        LOCAL_START_ABSOLUTE_MIN,
+        noiseFloor * LOCAL_START_MULTIPLIER,
+      );
+
+      if (rms >= startLevel) {
+        startTicks += 1;
+      } else {
+        // Only let unquestionably quiet samples update the room estimate.
+        if (rms < startLevel * 0.70) {
+          noiseFloor = Math.max(
+            LOCAL_NOISE_FLOOR_MIN,
+            noiseFloor * 0.98 + rms * 0.02,
+          );
+        }
+        startTicks = 0;
+      }
+
+      if (startTicks >= LOCAL_START_TICKS) {
+        lastLoudAt = now;
+        mark(
+          `speech trigger: rms=${rms.toFixed(3)} ` +
+          `floor=${noiseFloor.toFixed(3)} start=${startLevel.toFixed(3)}`
+        );
+        startTicks = 0;
+        beginCapture();
+      }
+      return;
+    }
+
+    const current = capture;
+    if (current.recorder.state !== "recording") return;
+
+    const keepLevel = Math.max(
+      LOCAL_KEEP_ABSOLUTE_MIN,
+      noiseFloor * LOCAL_KEEP_MULTIPLIER,
+    );
+
+    if (rms >= keepLevel) {
+      lastLoudAt = now;
+    }
+
+    const strongLevel = Math.max(
+      LOCAL_START_ABSOLUTE_MIN,
+      noiseFloor * LOCAL_START_MULTIPLIER,
+    );
+
+    if (rms >= strongLevel) {
+      current.strongTicks += 1;
+    }
+
+    const age = now - current.startedAt;
+
+    if (age >= LOCAL_MAX_UTTERANCE_MS) {
+      mark("utterance limit reached");
+      finishCapture(true);
+      lastLoudAt = 0;
+      return;
+    }
+
+    if (
+      lastLoudAt &&
+      age >= LOCAL_MIN_UTTERANCE_MS &&
+      now - lastLoudAt >= LOCAL_SILENCE_MS
+    ) {
+      mark("speech ended");
+      finishCapture(true);
+      lastLoudAt = 0;
+    }
+  }
+
+  async function openMic() {
+    if (stream?.active || opening) return opening ?? Promise.resolve();
+
+    opening = (async () => {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      if (!shouldListen) {
+        newStream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
+      stream = newStream;
+      openedAt = Date.now();
+      noiseFloor = LOCAL_NOISE_FLOOR_MIN;
+      startTicks = 0;
+      audioCtx = new AudioContext();
+
+      const source = audioCtx.createMediaStreamSource(newStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      meter = new Uint8Array(analyser.fftSize);
+
+      vadTimer = setInterval(sampleMic, LOCAL_VAD_POLL_MS);
+      mark("local STT microphone attached");
+    })()
+      .catch((e) => {
+        console.error("[voice-local] microphone open failed", e);
+        onError("Could not open microphone for local speech recognition.");
+      })
+      .finally(() => {
+        opening = null;
+      });
+
+    return opening;
+  }
+
+  function closeMic() {
+    finishCapture(false);
+    onLevel(0);
+
+    if (vadTimer) {
+      clearInterval(vadTimer);
+      vadTimer = null;
+    }
+
+    stream?.getTracks().forEach((track) => track.stop());
+    stream = null;
+    analyser = null;
+    meter = null;
+
+    if (audioCtx) {
+      void audioCtx.close().catch(() => {});
+      audioCtx = null;
+    }
+  }
+
+  return {
+    start() {
+      shouldListen = true;
+      paused = false;
+      void openMic();
+    },
+
+    stop() {
+      shouldListen = false;
+      paused = false;
+      closeMic();
+    },
+
+    pause() {
+      paused = true;
+      finishCapture(false);
+    },
+
+    resume() {
+      paused = false;
+      if (shouldListen) void openMic();
+    },
+
+    restart(reason: string) {
+      if (!shouldListen || paused) return;
+      mark(`restarting local capture: ${reason}`);
+      closeMic();
+      setTimeout(() => {
+        if (shouldListen && !paused) void openMic();
+      }, 250);
+    },
+  };
+}
+
 
 // ---------------------------------------------------------------------------
 // Audio Player — ordered chunks with acknowledgements
