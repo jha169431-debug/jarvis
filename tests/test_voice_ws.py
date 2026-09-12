@@ -37,6 +37,12 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
     monkeypatch.setenv("FISH_API_KEY", "fish-test")
     monkeypatch.setenv("JARVIS_STT_MODE", "web")
+
+    # These tests install their own FakeBrain/ExplodingBrain. Do not let the
+    # lifespan start a real Claude/Ollama/Antigravity child in the background:
+    # its startup timing must not change which voice frame a test receives.
+    monkeypatch.setenv("JARVIS_BRAIN_AUTOSTART", "0")
+
     import data_paths
     importlib.reload(data_paths)
     import run_store
@@ -44,6 +50,13 @@ def client(monkeypatch, tmp_path):
     import server
     importlib.reload(server)
     run_store.init_db()
+
+    # Preflight has its own tests. Voice-protocol tests must not race a startup
+    # warning against the utterance they are trying to assert.
+    async def no_preflight():
+        return None
+
+    monkeypatch.setattr(server, "_run_preflight", no_preflight)
 
     async def fake_synth(text):
         return b"MP3:" + text.encode()
