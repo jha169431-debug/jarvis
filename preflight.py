@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import shutil
+import shlex
 import sys
 import time
 from dataclasses import dataclass
@@ -345,6 +346,64 @@ async def _check_claude_login(timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
             message += " OAuth refresh token is current."
 
     return Check(name="claude_login", status=STATUS_OK, message=message)
+
+
+async def _check_antigravity_cli(
+        timeout: float = DEFAULT_CHECK_TIMEOUT) -> Check:
+    """Verify the Antigravity CLI exists without spending a cloud model turn."""
+
+    configured = os.getenv("JARVIS_AGY_PATH", "").strip()
+
+    if configured:
+        try:
+            argv = shlex.split(configured)
+        except ValueError as e:
+            return Check(
+                name="antigravity_cli",
+                status=STATUS_FAIL,
+                message=f"JARVIS_AGY_PATH could not be parsed: {e}",
+                remedy="Fix JARVIS_AGY_PATH or unset it so `agy` is found on PATH.",
+            )
+        if not argv:
+            return Check(
+                name="antigravity_cli",
+                status=STATUS_FAIL,
+                message="JARVIS_AGY_PATH is empty after parsing.",
+                remedy="Fix JARVIS_AGY_PATH or unset it so `agy` is found on PATH.",
+            )
+    else:
+        agy = shutil.which("agy")
+        if not agy:
+            return Check(
+                name="antigravity_cli",
+                status=STATUS_FAIL,
+                message="Antigravity is selected but `agy` is not on PATH.",
+                remedy="Install Antigravity CLI and make sure the `agy` command is on PATH.",
+            )
+        argv = [agy]
+
+    rc, stdout, stderr = await _run_subprocess(
+        *argv, "--version", timeout=timeout)
+
+    if rc != 0:
+        return Check(
+            name="antigravity_cli",
+            status=STATUS_FAIL,
+            message=(
+                "`agy --version` failed: "
+                f"{(stderr or stdout).strip() or f'exit {rc}'}"
+            ),
+            remedy="Run `agy --version` in a terminal and fix the Antigravity CLI installation.",
+        )
+
+    version = (stdout or stderr).strip().splitlines()
+    version_text = version[0] if version else "unknown version"
+
+    return Check(
+        name="antigravity_cli",
+        status=STATUS_OK,
+        message=f"Antigravity CLI {version_text} is available.",
+    )
 
 
 async def _check_ollama_backend(
@@ -771,6 +830,7 @@ _ASYNC_CHECKS = (
     _check_claude_cli,
     _check_claude_login,
     _check_ollama_backend,
+    _check_antigravity_cli,
     _check_accessibility,
 )
 _SYNC_CHECKS = (
@@ -780,6 +840,55 @@ _SYNC_CHECKS = (
     _check_screen_recording_sync,
     _check_linux_desktop_sync,
 )
+
+
+def _selected_provider() -> str:
+    """Return the provider whose runtime requirements preflight should check."""
+    return os.getenv("JARVIS_LLM_PROVIDER", "claude").strip().lower() or "claude"
+
+
+def _checks_for_provider(provider: str):
+    """Select only checks relevant to the active brain backend.
+
+    Unknown providers preserve the historical Claude behavior because
+    brain.py also routes non-Antigravity/non-Ollama operation through
+    Claude Code.
+    """
+    provider = (provider or "claude").strip().lower()
+
+    provider_async = {
+        _check_claude_cli,
+        _check_claude_login,
+        _check_ollama_backend,
+        _check_antigravity_cli,
+    }
+
+    if provider == "antigravity":
+        wanted_async = {_check_antigravity_cli}
+    elif provider == "ollama":
+        # Ollama is reached through the existing Claude Code-compatible
+        # process path, so the CLI is still required, but Claude OAuth is not.
+        wanted_async = {_check_claude_cli, _check_ollama_backend}
+    else:
+        wanted_async = {_check_claude_cli, _check_claude_login}
+
+    async_checks = tuple(
+        fn for fn in _ASYNC_CHECKS
+        if fn not in provider_async or fn in wanted_async
+    )
+
+    # These settings belong specifically to the Claude Code process/session
+    # architecture. Antigravity has its own MCP and permission configuration.
+    claude_sync = {
+        _check_anthropic_key_leftover_sync,
+        _check_cross_session_inbound_sync,
+    }
+    sync_checks = tuple(
+        fn for fn in _SYNC_CHECKS
+        if provider != "antigravity" or fn not in claude_sync
+    )
+
+    return async_checks, sync_checks
 
 
 async def _run_one(fn, *, is_async: bool, timeout: float) -> Check:
@@ -813,8 +922,9 @@ async def run_checks(*, timeout: float = DEFAULT_CHECK_TIMEOUT) -> list[Check]:
     Never raises. Safe to call at startup: the worst case is a handful of
     `warn` results after `timeout` seconds, not a hung or crashed server.
     """
-    tasks = [_run_one(fn, is_async=True, timeout=timeout) for fn in _ASYNC_CHECKS]
-    tasks += [_run_one(fn, is_async=False, timeout=timeout) for fn in _SYNC_CHECKS]
+    async_checks, sync_checks = _checks_for_provider(_selected_provider())
+    tasks = [_run_one(fn, is_async=True, timeout=timeout) for fn in async_checks]
+    tasks += [_run_one(fn, is_async=False, timeout=timeout) for fn in sync_checks]
     return await asyncio.gather(*tasks)
 
 
@@ -838,6 +948,8 @@ def _phrase_for(check: Check) -> str:
         return "Claude Code's login couldn't be checked"
     if name == "ollama_backend":
         return "the local Ollama backend isn't ready"
+    if name == "antigravity_cli":
+        return "the Antigravity CLI isn't ready"
     if name == "linux_desktop":
         return "the Linux desktop backend isn't ready"
     if name == "accessibility":

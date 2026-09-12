@@ -520,7 +520,8 @@ async def test_run_checks_never_raises_even_with_a_broken_check(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_checks_runs_all_registered_checks(monkeypatch):
+async def test_run_checks_runs_all_checks_for_claude_provider(monkeypatch):
+    monkeypatch.setenv("JARVIS_LLM_PROVIDER", "claude")
     monkeypatch.setattr(preflight.shutil, "which", lambda name: None)  # claude missing -> fast fail
     monkeypatch.setattr(preflight.sys, "platform", "linux")  # accessibility skipped -> fast warn
     monkeypatch.delenv("FISH_API_KEY", raising=False)
@@ -531,7 +532,6 @@ async def test_run_checks_runs_all_registered_checks(monkeypatch):
     assert names == {
         "claude_cli",
         "claude_login",
-        "ollama_backend",
         "accessibility",
         "screen_recording",
         "linux_desktop",
@@ -539,6 +539,44 @@ async def test_run_checks_runs_all_registered_checks(monkeypatch):
         "anthropic_key_leftover",
         "cross_session_inbound",
     }
+
+
+@pytest.mark.asyncio
+async def test_antigravity_provider_runs_only_its_backend_check(monkeypatch):
+    monkeypatch.setenv("JARVIS_LLM_PROVIDER", "antigravity")
+    monkeypatch.setattr(preflight.sys, "platform", "linux")
+    monkeypatch.setattr(
+        preflight.shutil,
+        "which",
+        lambda name: "/home/test/.local/bin/agy" if name == "agy" else None,
+    )
+
+    async def fake_run(*args, timeout, env=None):
+        assert args == ("/home/test/.local/bin/agy", "--version")
+        return 0, "1.2.2\n", ""
+
+    monkeypatch.setattr(preflight, "_run_subprocess", fake_run)
+
+    results = await preflight.run_checks(timeout=1.0)
+    names = {c.name for c in results}
+
+    assert "antigravity_cli" in names
+    assert "claude_cli" not in names
+    assert "claude_login" not in names
+    assert "ollama_backend" not in names
+    assert "anthropic_key_leftover" not in names
+    assert "cross_session_inbound" not in names
+
+
+@pytest.mark.asyncio
+async def test_antigravity_cli_missing_fails(monkeypatch):
+    monkeypatch.delenv("JARVIS_AGY_PATH", raising=False)
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: None)
+
+    check = await preflight._check_antigravity_cli()
+
+    assert check.status == STATUS_FAIL
+    assert "not on PATH" in check.message
 
 
 # --- spoken_summary -------------------------------------------------------------
